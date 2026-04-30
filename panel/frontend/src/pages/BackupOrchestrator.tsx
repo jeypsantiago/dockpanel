@@ -765,20 +765,44 @@ function AllBackupsTab({
                           >Cancel</button>
                         </div>
                       ) : (
-                        <button
-                          type="button"
-                          onClick={() => handleDrillClick(row)}
-                          className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-rust-400 border border-rust-500/30 rounded"
-                          title={
-                            row.kind === "site"
-                              ? "Restore into a scratch nginx and probe HTTP — proves the backup is actually deployable"
-                            : row.kind === "database"
-                              ? "Boot a scratch engine, restore the dump, count rows — proves the backup is actually queryable"
-                              : "Restore into a scratch Docker volume + read-test through a probe container — proves the backup is actually mountable"
-                          }
-                        >
-                          Drill
-                        </button>
+                        <div className="inline-flex items-center gap-1.5">
+                          {row.kind === "site" && (
+                            <span
+                              className="inline-flex items-center rounded border border-dark-500 overflow-hidden"
+                              title="Chain-of-trust report: this backup's full provenance — integrity hashes, every verification, every restore drill"
+                            >
+                              <span className="px-2 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-800 text-dark-300 border-r border-dark-500">
+                                Report
+                              </span>
+                              <a
+                                href={`/api/backup-orchestrator/chain-report/site/${row.id}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="px-2 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-accent-400 border-r border-dark-500"
+                              >JSON</a>
+                              <a
+                                href={`/api/backup-orchestrator/chain-report/site/${row.id}/pdf`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="px-2 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-rust-400"
+                              >PDF</a>
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleDrillClick(row)}
+                            className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-rust-400 border border-rust-500/30 rounded"
+                            title={
+                              row.kind === "site"
+                                ? "Restore into a scratch nginx and probe HTTP — proves the backup is actually deployable"
+                              : row.kind === "database"
+                                ? "Boot a scratch engine, restore the dump, count rows — proves the backup is actually queryable"
+                                : "Restore into a scratch Docker volume + read-test through a probe container — proves the backup is actually mountable"
+                            }
+                          >
+                            Drill
+                          </button>
+                        </div>
                       )}
                     </td>
                   </tr>

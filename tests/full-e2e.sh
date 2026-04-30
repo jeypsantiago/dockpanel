@@ -236,6 +236,21 @@ else
 fi
 
 echo ""
+echo "── Chain-of-Trust Report (sub-suite) ──"
+CHAIN_SCRIPT="$(dirname "$0")/chain-report-e2e.sh"
+if [ -x "$CHAIN_SCRIPT" ]; then
+    if bash "$CHAIN_SCRIPT" > /tmp/chain_report_output 2>&1; then
+        CHAIN_LINE=$(grep -oP '\d+ passed, \d+ failed(?:, \d+ skipped)?' /tmp/chain_report_output | tail -1)
+        green "Chain-of-trust report e2e — ${CHAIN_LINE:-passed}"
+    else
+        red "Chain-of-trust report e2e (see /tmp/chain_report_output)"
+        tail -20 /tmp/chain_report_output
+    fi
+else
+    skip "Chain-of-trust report e2e — $CHAIN_SCRIPT not executable"
+fi
+
+echo ""
 echo "═══════════════════════════════════════════════"
 echo "  Results: $PASS passed, $FAIL failed, $SKIP skipped ($TOTAL total)"
 echo "═══════════════════════════════════════════════"

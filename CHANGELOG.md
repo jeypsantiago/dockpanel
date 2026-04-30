@@ -6,6 +6,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.1] - 2026-04-30
+
+### Added
+
+- **Chain-of-trust report for site backups** (Phase 4 W1.3). Every site
+  backup is now downloadable as a single forensic artifact bundling its
+  full provenance chain — the backup itself (filename, size, SHA-256,
+  previous-hash link, chain-validity flag), every passive verification
+  run against it (status, checks-passed/total, duration, errors), and
+  every end-to-end restore drill (status, HTTP probe result, body
+  excerpt, duration). Two formats from the same data:
+  - `GET /api/backup-orchestrator/chain-report/site/{id}` — JSON.
+  - `GET /api/backup-orchestrator/chain-report/site/{id}/pdf` — typst-rendered
+    PDF with DockPanel branding, status pills, and a full chain-integrity
+    summary. Designed to be handed to an auditor as proof a backup was
+    actually verified and restorable.
+
+  All Backups tab on the Backup Orchestrator page now shows a `Report
+  | JSON | PDF` 3-segment control on every site row. The first PDF
+  request lazy-installs the `typst` CLI into `/var/lib/dockpanel/typst/`
+  (~30 MB, one-time, ~30 s on a fresh box); subsequent renders are
+  instant. Compile timeout 30 s; install timeout 90 s; concurrent
+  installs serialised via a process-wide async mutex so a burst of first
+  requests doesn't stampede.
+
+  Site-only for v2.8.1 because only `backups.sha256_hash` /
+  `previous_hash` / `chain_valid` are populated today (added in audit
+  migration `20260324000000`). The db + volume backup tables don't
+  carry hashes yet — extending chain reports across all three kinds is
+  a v2.8.2 follow-up that needs a hash-columns migration plus agent
+  changes to compute SHA-256 during db/volume backup.
+
+### Fixed
+
+- **`/api/backup-orchestrator/health` 500 once any backup exists.**
+  `SUM(size_bytes)` returns `NUMERIC` in PostgreSQL (since aggregating
+  `BIGINT` can overflow `int8`); the existing query bound it to
+  `Option<i64>` without an explicit cast. Empty backup tables returned
+  `NULL` and decoded fine, but the moment a real backup row landed the
+  endpoint started 500ing with `INT8 not compatible with NUMERIC`. Cast
+  to `::bigint` in three sites in `routes/backup_orchestrator.rs::health`
+  + the rolled-up SUM in `services/backup_policy_executor.rs`. Caught by
+  the v2.8.1 fresh-VPS test once a synthetic backup row was seeded for
+  the chain-report PDF round-trip.
+
+### Tests
+
+- New `tests/chain-report-e2e.sh` sub-suite: unauthenticated request
+  blocked, bogus uuid → 404, JSON shape, PDF magic bytes / Content-Type
+  / Content-Disposition, file-size sanity. Wired into `full-e2e.sh`
+  alongside the tier2-pin sub-suite. Self-provisions auth (mints admin
+  JWT from `api.env` if `DOCKPANEL_TEST_PASSWORD` is unset). Skips PDF
+  assertion when `CHAIN_REPORT_SKIP_PDF=1` (CI without outbound HTTPS)
+  and reports 503 cleanly when typst install fails so the suite still
+  green-lights on networks that block GitHub releases.
+
 ## [2.8.0] - 2026-05-01
 
 ### Added

@@ -80,9 +80,10 @@ async fn tick(db: &PgPool, agent: &AgentClient, jwt_secret: &str) -> Result<(), 
         execute_policy(db, agent, policy, jwt_secret).await;
     }
 
-    // Record backup storage metric for growth tracking
+    // Record backup storage metric for growth tracking. SUM(BIGINT) returns
+    // NUMERIC in postgres — cast to bigint so sqlx can decode into i64.
     let total_storage: Option<(i64,)> = sqlx::query_as(
-        "SELECT COALESCE(SUM(size_bytes), 0) FROM ( \
+        "SELECT COALESCE(SUM(size_bytes), 0)::bigint FROM ( \
             SELECT size_bytes FROM backups UNION ALL \
             SELECT size_bytes FROM database_backups UNION ALL \
             SELECT size_bytes FROM volume_backups \

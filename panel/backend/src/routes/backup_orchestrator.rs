@@ -305,11 +305,14 @@ pub async fn health(
     let (total_vol,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM volume_backups")
         .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
 
-    let (site_storage,): (Option<i64>,) = sqlx::query_as("SELECT SUM(size_bytes) FROM backups")
+    // SUM(BIGINT) returns NUMERIC in postgres — cast back to bigint so sqlx can
+    // decode into Option<i64>. Empty rowsets give NULL, populated ones used to
+    // 500 with "INT8 not compatible with NUMERIC" until this cast was added.
+    let (site_storage,): (Option<i64>,) = sqlx::query_as("SELECT SUM(size_bytes)::bigint FROM backups")
         .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
-    let (db_storage,): (Option<i64>,) = sqlx::query_as("SELECT SUM(size_bytes) FROM database_backups")
+    let (db_storage,): (Option<i64>,) = sqlx::query_as("SELECT SUM(size_bytes)::bigint FROM database_backups")
         .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
-    let (vol_storage,): (Option<i64>,) = sqlx::query_as("SELECT SUM(size_bytes) FROM volume_backups")
+    let (vol_storage,): (Option<i64>,) = sqlx::query_as("SELECT SUM(size_bytes)::bigint FROM volume_backups")
         .fetch_one(db).await.map_err(|e| internal_error("health", e))?;
 
     let total_storage = site_storage.unwrap_or(0) + db_storage.unwrap_or(0) + vol_storage.unwrap_or(0);
@@ -1376,4 +1379,244 @@ pub async fn list_drills(
         .map_err(|e| internal_error("list drills count", e))?;
 
     Ok(Json(DrillsResponse { items, total }))
+}
+
+// ── Chain-of-Trust Report (Phase 4 W1.3) ────────────────────────────────────
+//
+// Site-only for v2.8.1 — `backups.sha256_hash`/`previous_hash`/`chain_valid`
+// columns exist on the site backup table (migration 20260324000000); the db +
+// volume tables don't carry hashes yet. v2.8.2 extends this once those
+// migrations land + the agent computes hashes during db/volume backup.
+
+#[derive(serde::Serialize)]
+pub struct ChainReportBackup {
+    pub id: Uuid,
+    pub site_id: Uuid,
+    pub site_name: String,
+    pub filename: String,
+    pub size_bytes: i64,
+    pub sha256_hash: Option<String>,
+    pub previous_hash: Option<String>,
+    pub chain_valid: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ChainReportVerification {
+    pub id: Uuid,
+    pub status: String,
+    pub checks_run: i32,
+    pub checks_passed: i32,
+    pub duration_ms: Option<i32>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub error_message: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ChainReportDrill {
+    pub id: Uuid,
+    pub status: String,
+    pub http_status: Option<i32>,
+    pub body_excerpt: Option<String>,
+    pub duration_ms: Option<i32>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub error_message: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ChainIntegrity {
+    pub chain_valid: bool,
+    pub verifications_passed: i64,
+    pub drills_passed: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct ChainReport {
+    pub panel_version: String,
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    pub backup: ChainReportBackup,
+    pub verifications: Vec<ChainReportVerification>,
+    pub drills: Vec<ChainReportDrill>,
+    pub chain_integrity: ChainIntegrity,
+}
+
+/// Build a site chain-of-trust report from the database. Returns 404 if the
+/// backup doesn't exist. Single point of truth for both JSON and PDF endpoints.
+async fn build_site_chain_report(
+    state: &AppState,
+    backup_id: Uuid,
+) -> Result<ChainReport, ApiError> {
+    let row: Option<(
+        Uuid,                                       // id
+        Uuid,                                       // site_id
+        String,                                     // site_name (domain)
+        String,                                     // filename
+        i64,                                        // size_bytes
+        Option<String>,                             // sha256_hash
+        Option<String>,                             // previous_hash
+        Option<bool>,                               // chain_valid (DEFAULT TRUE but column is nullable)
+        chrono::DateTime<chrono::Utc>,              // created_at
+    )> = sqlx::query_as(
+        "SELECT b.id, b.site_id, s.domain, b.filename, b.size_bytes, \
+                b.sha256_hash, b.previous_hash, b.chain_valid, b.created_at \
+           FROM backups b JOIN sites s ON s.id = b.site_id \
+          WHERE b.id = $1"
+    )
+    .bind(backup_id)
+    .fetch_optional(&state.db).await
+    .map_err(|e| internal_error("chain report: load backup", e))?;
+
+    let (id, site_id, site_name, filename, size_bytes, sha256_hash, previous_hash, chain_valid, created_at) =
+        row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
+
+    let chain_valid = chain_valid.unwrap_or(true);
+
+    let verifications_rows: Vec<(
+        Uuid, String, i32, i32, Option<i32>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        chrono::DateTime<chrono::Utc>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, status, checks_run, checks_passed, duration_ms, \
+                started_at, completed_at, created_at, error_message \
+           FROM backup_verifications \
+          WHERE backup_type = 'site' AND backup_id = $1 \
+          ORDER BY created_at ASC"
+    )
+    .bind(backup_id)
+    .fetch_all(&state.db).await
+    .map_err(|e| internal_error("chain report: load verifications", e))?;
+
+    let drills_rows: Vec<(
+        Uuid, String, Option<i32>, Option<String>, Option<i32>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        chrono::DateTime<chrono::Utc>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, status, http_status, body_excerpt, duration_ms, \
+                started_at, completed_at, created_at, error_message \
+           FROM backup_drills \
+          WHERE backup_type = 'site' AND backup_id = $1 \
+          ORDER BY created_at ASC"
+    )
+    .bind(backup_id)
+    .fetch_all(&state.db).await
+    .map_err(|e| internal_error("chain report: load drills", e))?;
+
+    let verifications: Vec<ChainReportVerification> = verifications_rows.into_iter().map(
+        |(id, status, checks_run, checks_passed, duration_ms, started_at, completed_at, created_at, error_message)| {
+            ChainReportVerification {
+                id, status, checks_run, checks_passed, duration_ms,
+                started_at, completed_at, created_at, error_message,
+            }
+        }
+    ).collect();
+
+    let drills: Vec<ChainReportDrill> = drills_rows.into_iter().map(
+        |(id, status, http_status, body_excerpt, duration_ms, started_at, completed_at, created_at, error_message)| {
+            ChainReportDrill {
+                id, status, http_status, body_excerpt, duration_ms,
+                started_at, completed_at, created_at, error_message,
+            }
+        }
+    ).collect();
+
+    let verifications_passed = verifications.iter().filter(|v| v.status == "passed").count() as i64;
+    let drills_passed = drills.iter().filter(|d| d.status == "passed").count() as i64;
+
+    Ok(ChainReport {
+        panel_version: env!("CARGO_PKG_VERSION").to_string(),
+        generated_at: chrono::Utc::now(),
+        backup: ChainReportBackup {
+            id, site_id, site_name, filename, size_bytes,
+            sha256_hash, previous_hash, chain_valid, created_at,
+        },
+        verifications,
+        drills,
+        chain_integrity: ChainIntegrity {
+            chain_valid,
+            verifications_passed,
+            drills_passed,
+        },
+    })
+}
+
+/// Helper: short backup id suffix for filename. e.g. "a1b2c3d4".
+fn short_id(id: Uuid) -> String {
+    id.to_string().chars().take(8).collect()
+}
+
+/// Helper: sanitise a site name into a filesystem-safe slug for the PDF
+/// filename. Keeps alphanum + dashes; collapses other chars to "-".
+fn slug(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+            out.push(c);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// GET /api/backup-orchestrator/chain-report/site/{id} — Chain-of-trust JSON
+/// for one site backup. Single artifact, full provenance chain (backup
+/// integrity hashes + every verification + every restore drill).
+pub async fn chain_report_site_json(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ChainReport>, ApiError> {
+    let report = build_site_chain_report(&state, id).await?;
+    Ok(Json(report))
+}
+
+/// GET /api/backup-orchestrator/chain-report/site/{id}/pdf — Chain-of-trust
+/// PDF rendered via typst. First call lazy-installs typst into
+/// /var/lib/dockpanel/typst (~30MB, one-time). 503 if install/compile fails.
+pub async fn chain_report_site_pdf(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    Path(id): Path<Uuid>,
+) -> Result<axum::response::Response, ApiError> {
+    let report = build_site_chain_report(&state, id).await?;
+    let json_value = serde_json::to_value(&report)
+        .map_err(|e| internal_error("chain report: serialize", e))?;
+
+    let pdf = crate::services::chain_report::render_chain_report_pdf(&json_value)
+        .await
+        .map_err(|e| {
+            tracing::warn!("chain report pdf render failed: {e}");
+            err(StatusCode::SERVICE_UNAVAILABLE, &format!("PDF generation failed: {e}"))
+        })?;
+
+    let filename = format!(
+        "chain-report-{}-{}.pdf",
+        slug(&report.backup.site_name),
+        short_id(report.backup.id),
+    );
+
+    use axum::http::header;
+    let response = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/pdf")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .body(axum::body::Body::from(pdf))
+        .map_err(|e| internal_error("chain report: build response", e))?;
+
+    Ok(response)
 }
