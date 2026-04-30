@@ -3,6 +3,7 @@ import { useAuth } from "../context/AuthContext";
 import { api } from "../api";
 import ProvisionLog from "../components/ProvisionLog";
 import UpdatesContent from "./Updates";
+import { timeAgo } from "../utils/format";
 
 interface HealthStatus {
   db: string;
@@ -2675,14 +2676,29 @@ interface ImageScanSettingsState {
 
 function ImageScanSettings({ setMessage }: { setMessage: (m: { text: string; type: string }) => void }) {
   const [s, setS] = useState<ImageScanSettingsState | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [uninstallConfirm, setUninstallConfirm] = useState(false);
+  const [lastSweep, setLastSweep] = useState<{ scanned_at: string; image_count: number } | null>(null);
 
   const load = () => {
+    setLoadError(null);
     api.get<ImageScanSettingsState>("/image-scan/settings")
       .then(setS)
-      .catch(() => setS(null));
+      .catch((e: unknown) => {
+        setS(null);
+        setLoadError(e instanceof Error ? e.message : "Failed to load settings");
+      });
+    api.get<{ image: string; scanned_at: string }[]>("/image-scan/recent")
+      .then(scans => {
+        if (!scans || scans.length === 0) { setLastSweep(null); return; }
+        const newest = scans.reduce((acc, x) =>
+          new Date(x.scanned_at).getTime() > new Date(acc.scanned_at).getTime() ? x : acc
+        );
+        setLastSweep({ scanned_at: newest.scanned_at, image_count: scans.length });
+      })
+      .catch(() => setLastSweep(null));
   };
 
   useEffect(() => { load(); }, []);
@@ -2741,7 +2757,14 @@ function ImageScanSettings({ setMessage }: { setMessage: (m: { text: string; typ
         <div className="px-5 py-3 border-b border-dark-600">
           <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Image Vulnerability Scanning</h3>
         </div>
-        <div className="p-5 text-sm text-dark-300">Loading...</div>
+        {loadError ? (
+          <div className="p-5 flex items-center justify-between gap-3">
+            <p className="text-sm text-danger-400">Could not load scanner settings: {loadError}</p>
+            <button type="button" onClick={load} className="px-3 py-1.5 bg-dark-600 text-dark-50 rounded-lg text-xs font-medium hover:bg-dark-500 shrink-0">Retry</button>
+          </div>
+        ) : (
+          <div className="p-5 text-sm text-dark-300">Loading...</div>
+        )}
       </div>
     );
   }
@@ -2757,31 +2780,47 @@ function ImageScanSettings({ setMessage }: { setMessage: (m: { text: string; typ
           <div>
             <div className="text-sm font-medium text-dark-50 flex items-center gap-2">
               Scanner (grype)
-              <span className={`w-2 h-2 rounded-full ${s.installed ? "bg-rust-400" : "bg-dark-500"}`} title={s.installed ? "Installed" : "Not installed"} />
+              <span
+                className={`w-2 h-2 rounded-full ${s.installed ? "bg-rust-400" : "bg-dark-500"}`}
+                role="img"
+                aria-label={s.installed ? "Scanner installed" : "Scanner not installed"}
+                title={s.installed ? "Installed" : "Not installed"}
+              />
             </div>
             <p className="text-[10px] text-dark-300 mt-0.5">~70MB binary + vulnerability database. Required for any scanning.</p>
+            {s.installed && (
+              <p className="text-[10px] text-dark-300 mt-1">
+                {lastSweep
+                  ? <>Last scan <span title={new Date(lastSweep.scanned_at).toLocaleString()} className="text-dark-200">{timeAgo(lastSweep.scanned_at)}</span> · {lastSweep.image_count} image{lastSweep.image_count === 1 ? "" : "s"} on file</>
+                  : <>No scans recorded yet.</>}
+              </p>
+            )}
           </div>
           {s.installed ? (
             uninstallConfirm ? (
               <div className="flex gap-2">
-                <button onClick={uninstall} disabled={installing} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 disabled:opacity-50">
-                  {installing ? "..." : "Confirm"}
+                <button type="button" onClick={uninstall} disabled={installing} className="px-2.5 py-1 bg-danger-500 text-white rounded-lg text-[10px] font-medium hover:bg-danger-400 disabled:opacity-50">
+                  {installing ? "Removing..." : "Confirm uninstall"}
                 </button>
-                <button onClick={() => setUninstallConfirm(false)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500">
+                <button type="button" onClick={() => setUninstallConfirm(false)} className="px-2.5 py-1 bg-dark-600 text-dark-200 rounded-lg text-[10px] font-medium hover:bg-dark-500">
                   Cancel
                 </button>
               </div>
             ) : (
-              <button onClick={() => setUninstallConfirm(true)} className="px-2.5 py-1 bg-danger-500/10 text-danger-400 border border-danger-500/20 rounded-lg text-[10px] font-medium hover:bg-danger-500/20">
+              <button type="button" onClick={() => setUninstallConfirm(true)} aria-label="Uninstall image scanner" className="px-2.5 py-1 bg-danger-500/10 text-danger-400 border border-danger-500/20 rounded-lg text-[10px] font-medium hover:bg-danger-500/20">
                 Uninstall
               </button>
             )
           ) : (
-            <button onClick={install} disabled={installing} className="px-3 py-1.5 bg-rust-500 text-white rounded-md text-xs font-medium hover:bg-rust-600 disabled:opacity-50">
+            <button type="button" onClick={install} disabled={installing} className="px-3 py-1.5 bg-rust-500 text-white rounded-lg text-xs font-medium hover:bg-rust-600 disabled:opacity-50">
               {installing ? "Installing..." : "Install Scanner"}
             </button>
           )}
         </div>
+
+        {!s.installed && (
+          <p className="text-[11px] text-dark-300 -mt-2 ml-1">Install the scanner above to enable scheduled scans and the deploy gate.</p>
+        )}
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label className="flex items-start gap-3 border border-dark-600 bg-dark-900/50 rounded p-4 cursor-pointer hover:bg-dark-900">
@@ -2860,13 +2899,18 @@ interface SbomSettingsState {
 
 function SbomSettings({ setMessage }: { setMessage: (m: { text: string; type: string }) => void }) {
   const [s, setS] = useState<SbomSettingsState | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
   const [uninstallConfirm, setUninstallConfirm] = useState(false);
 
   const load = () => {
+    setLoadError(null);
     api.get<SbomSettingsState>("/sbom/settings")
       .then(setS)
-      .catch(() => setS(null));
+      .catch((e: unknown) => {
+        setS(null);
+        setLoadError(e instanceof Error ? e.message : "Failed to load settings");
+      });
   };
 
   useEffect(() => { load(); }, []);
@@ -2904,7 +2948,14 @@ function SbomSettings({ setMessage }: { setMessage: (m: { text: string; type: st
         <div className="px-5 py-3 border-b border-dark-600">
           <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">SBOM Generation</h3>
         </div>
-        <div className="p-5 text-sm text-dark-300">Loading...</div>
+        {loadError ? (
+          <div className="p-5 flex items-center justify-between gap-3">
+            <p className="text-sm text-danger-400">Could not load SBOM settings: {loadError}</p>
+            <button type="button" onClick={load} className="px-3 py-1.5 bg-dark-600 text-dark-50 rounded-lg text-xs font-medium hover:bg-dark-500 shrink-0">Retry</button>
+          </div>
+        ) : (
+          <div className="p-5 text-sm text-dark-300">Loading...</div>
+        )}
       </div>
     );
   }
@@ -2914,33 +2965,39 @@ function SbomSettings({ setMessage }: { setMessage: (m: { text: string; type: st
       <div className="px-5 py-3 border-b border-dark-600">
         <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">SBOM Generation</h3>
         <p className="text-xs text-dark-200 mt-0.5">Generate SPDX 2.3 SBOMs for deployed images on demand (syft). Use the "Download SBOM" button on any app's scan drawer.</p>
+        <p className="text-[10px] text-dark-300 mt-1 italic">On-demand only — no schedule, no deploy gate. Install or uninstall is the only configuration.</p>
       </div>
       <div className="p-5 space-y-4">
         <div className="flex items-center justify-between border border-dark-600 bg-dark-900/50 rounded p-4">
           <div>
             <div className="text-sm font-medium text-dark-50 flex items-center gap-2">
               Generator (syft)
-              <span className={`w-2 h-2 rounded-full ${s.installed ? "bg-rust-400" : "bg-dark-500"}`} title={s.installed ? "Installed" : "Not installed"} />
+              <span
+                className={`w-2 h-2 rounded-full ${s.installed ? "bg-rust-400" : "bg-dark-500"}`}
+                role="img"
+                aria-label={s.installed ? "Generator installed" : "Generator not installed"}
+                title={s.installed ? "Installed" : "Not installed"}
+              />
             </div>
             <p className="text-[10px] text-dark-300 mt-0.5">~80MB binary. Required to generate SBOMs from container images.</p>
           </div>
           {s.installed ? (
             uninstallConfirm ? (
               <div className="flex gap-2">
-                <button onClick={uninstall} disabled={installing} className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-400 disabled:opacity-50">
-                  {installing ? "..." : "Confirm"}
+                <button type="button" onClick={uninstall} disabled={installing} className="px-2.5 py-1 bg-danger-500 text-white rounded-lg text-[10px] font-medium hover:bg-danger-400 disabled:opacity-50">
+                  {installing ? "Removing..." : "Confirm uninstall"}
                 </button>
-                <button onClick={() => setUninstallConfirm(false)} className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500">
+                <button type="button" onClick={() => setUninstallConfirm(false)} className="px-2.5 py-1 bg-dark-600 text-dark-200 rounded-lg text-[10px] font-medium hover:bg-dark-500">
                   Cancel
                 </button>
               </div>
             ) : (
-              <button onClick={() => setUninstallConfirm(true)} className="px-2.5 py-1 bg-danger-500/10 text-danger-400 border border-danger-500/20 rounded-lg text-[10px] font-medium hover:bg-danger-500/20">
+              <button type="button" onClick={() => setUninstallConfirm(true)} aria-label="Uninstall SBOM generator" className="px-2.5 py-1 bg-danger-500/10 text-danger-400 border border-danger-500/20 rounded-lg text-[10px] font-medium hover:bg-danger-500/20">
                 Uninstall
               </button>
             )
           ) : (
-            <button onClick={install} disabled={installing} className="px-3 py-1.5 bg-rust-500 text-white rounded-md text-xs font-medium hover:bg-rust-600 disabled:opacity-50">
+            <button type="button" onClick={install} disabled={installing} className="px-3 py-1.5 bg-rust-500 text-white rounded-lg text-xs font-medium hover:bg-rust-600 disabled:opacity-50">
               {installing ? "Installing..." : "Install Generator"}
             </button>
           )}

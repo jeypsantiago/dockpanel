@@ -3,6 +3,7 @@ import { Navigate } from "react-router-dom";
 import { useState, useEffect, useRef, useCallback, type ReactNode } from "react";
 import { api } from "../api";
 import ProvisionLog from "../components/ProvisionLog";
+import { timeAgo } from "../utils/format";
 
 interface EnvVar {
   name: string;
@@ -1322,17 +1323,24 @@ volumes:
                             Update
                           </span>
                         )}
-                        {app.image && (
-                          <button
-                            onClick={(e) => { e.stopPropagation(); openScanDrawer(app.image!); }}
-                            className={`inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-medium ${scanSeverityClass(scanFindings[app.image])} hover:opacity-80`}
-                            title={scanFindings[app.image]
-                              ? `Last scanned ${new Date(scanFindings[app.image].scanned_at).toLocaleString()}`
-                              : "Image not yet scanned"}
-                          >
-                            {scanSeverityLabel(scanFindings[app.image])}
-                          </button>
-                        )}
+                        {app.image && (() => {
+                          const f = scanFindings[app.image];
+                          const label = scanSeverityLabel(f);
+                          const aria = f
+                            ? `Open vulnerability scan for ${app.image} — ${label}, last scanned ${timeAgo(f.scanned_at)}`
+                            : `Open vulnerability scan for ${app.image} — not yet scanned`;
+                          return (
+                            <button
+                              type="button"
+                              onClick={(e) => { e.stopPropagation(); openScanDrawer(app.image!); }}
+                              className={`inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-medium ${scanSeverityClass(f)} hover:opacity-80`}
+                              title={f ? `Last scanned ${timeAgo(f.scanned_at)}` : "Image not yet scanned"}
+                              aria-label={aria}
+                            >
+                              {label}
+                            </button>
+                          );
+                        })()}
                         <select
                           value={appTags[app.container_id] || ''}
                           onChange={e => {
@@ -2629,15 +2637,20 @@ volumes:
         return (
           <div
             className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 dp-modal-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="scan-dialog-title"
+            tabIndex={-1}
             onClick={() => setScanDrawerImage(null)}
+            onKeyDown={(e) => { if (e.key === "Escape") setScanDrawerImage(null); }}
           >
             <div className="bg-dark-800 rounded-lg shadow-xl p-6 w-full max-w-3xl max-h-[80vh] overflow-y-auto border border-dark-500 dp-modal" onClick={e => e.stopPropagation()}>
               <div className="flex items-center justify-between mb-4">
                 <div>
-                  <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Image Vulnerability Scan</h3>
+                  <h3 id="scan-dialog-title" className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Image Vulnerability Scan</h3>
                   <p className="text-sm text-dark-50 font-mono mt-1 break-all">{scanDrawerImage}</p>
                 </div>
-                <button onClick={() => setScanDrawerImage(null)} className="text-dark-300 hover:text-dark-50 text-2xl leading-none">&times;</button>
+                <button type="button" onClick={() => setScanDrawerImage(null)} aria-label="Close" className="text-dark-300 hover:text-dark-50 text-2xl leading-none">&times;</button>
               </div>
 
               {finding ? (
@@ -2666,11 +2679,12 @@ volumes:
                   </div>
                   <div className="flex items-center justify-between mb-3 text-xs text-dark-300">
                     <span>Scanner: <span className="font-mono text-dark-200">{finding.scanner}</span></span>
-                    <span>Scanned {new Date(finding.scanned_at).toLocaleString()}</span>
+                    <span title={new Date(finding.scanned_at).toLocaleString()}>Scanned {timeAgo(finding.scanned_at)}</span>
                   </div>
                   {matchedApp && (
                     <div className="flex gap-2 mb-4">
                       <button
+                        type="button"
                         onClick={() => rescanApp(matchedApp.container_id, scanDrawerImage)}
                         disabled={scanRescanning === matchedApp.container_id}
                         className="px-3 py-1.5 text-xs font-medium bg-rust-600 text-white rounded hover:bg-rust-700 disabled:opacity-50"
@@ -2678,6 +2692,7 @@ volumes:
                         {scanRescanning === matchedApp.container_id ? "Scanning..." : "Rescan now"}
                       </button>
                       <button
+                        type="button"
                         onClick={() => downloadSbom(matchedApp.container_id, scanDrawerImage)}
                         disabled={sbomLoading === matchedApp.container_id}
                         title="Generate and download an SPDX 2.3 SBOM for this image (syft)"
@@ -2700,22 +2715,38 @@ volumes:
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-dark-600">
-                          {finding.vulnerabilities.slice(0, 200).map((v, i) => (
-                            <tr key={`${v.cve}-${v.package}-${i}`} className="hover:bg-dark-700/30">
-                              <td className="px-3 py-2 font-mono text-dark-50">{v.cve}</td>
-                              <td className="px-3 py-2">
-                                <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                                  v.severity === "critical" ? "bg-danger-500/15 text-danger-400" :
-                                  v.severity === "high" ? "bg-warn-500/15 text-warn-400" :
-                                  v.severity === "medium" ? "bg-warn-500/10 text-warn-300" :
-                                  "bg-accent-500/10 text-accent-400"
-                                }`}>{v.severity}</span>
-                              </td>
-                              <td className="px-3 py-2 text-dark-200">{v.package}</td>
-                              <td className="px-3 py-2 text-dark-300 font-mono">{v.installed_version}</td>
-                              <td className="px-3 py-2 text-dark-200 font-mono">{v.fixed_version || "—"}</td>
-                            </tr>
-                          ))}
+                          {finding.vulnerabilities.slice(0, 200).map((v, i) => {
+                            const sev = (v.severity || "").toLowerCase();
+                            const sevClass =
+                              sev === "critical" ? "bg-danger-500/15 text-danger-400" :
+                              sev === "high" ? "bg-warn-500/15 text-warn-400" :
+                              sev === "medium" ? "bg-warn-500/10 text-warn-300" :
+                              sev === "low" ? "bg-accent-500/10 text-accent-400" :
+                              "bg-dark-700 text-dark-300";
+                            const isCveId = /^CVE-\d{4}-\d{4,}$/i.test(v.cve);
+                            return (
+                              <tr key={`${v.cve}-${v.package}-${i}`} className="hover:bg-dark-700/30" title={v.description || undefined}>
+                                <td className="px-3 py-2 font-mono">
+                                  {isCveId ? (
+                                    <a
+                                      href={`https://nvd.nist.gov/vuln/detail/${encodeURIComponent(v.cve)}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-rust-400 hover:underline"
+                                    >{v.cve}</a>
+                                  ) : (
+                                    <span className="text-dark-50">{v.cve}</span>
+                                  )}
+                                </td>
+                                <td className="px-3 py-2">
+                                  <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ${sevClass}`}>{v.severity || "unknown"}</span>
+                                </td>
+                                <td className="px-3 py-2 text-dark-200">{v.package}</td>
+                                <td className="px-3 py-2 text-dark-300 font-mono">{v.installed_version}</td>
+                                <td className="px-3 py-2 text-dark-200 font-mono">{v.fixed_version || "—"}</td>
+                              </tr>
+                            );
+                          })}
                         </tbody>
                       </table>
                       {finding.vulnerabilities.length > 200 && (
@@ -2733,6 +2764,7 @@ volumes:
                   <p className="text-dark-300 text-sm mb-4">No scan recorded for this image.</p>
                   {matchedApp && (
                     <button
+                      type="button"
                       onClick={() => rescanApp(matchedApp.container_id, scanDrawerImage)}
                       disabled={scanRescanning === matchedApp.container_id}
                       className="px-4 py-2 text-sm font-medium bg-rust-600 text-white rounded hover:bg-rust-700 disabled:opacity-50"
