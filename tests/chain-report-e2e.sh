@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # DockPanel Chain-of-Trust Report E2E Test Suite
 #
-# Exercises the Phase 4 W1.3 chain-of-trust endpoints (v2.8.1):
-#   - GET /api/backup-orchestrator/chain-report/site/{id}        (JSON)
-#   - GET /api/backup-orchestrator/chain-report/site/{id}/pdf    (PDF, lazy-installs typst)
+# v2.8.1: site-only.
+# v2.8.2: extended to db + volume backups via the generic
+#   GET /api/backup-orchestrator/chain-report/{kind}/{id}        (JSON)
+#   GET /api/backup-orchestrator/chain-report/{kind}/{id}/pdf    (PDF, lazy-installs typst)
+# where {kind} ∈ {site, database, volume}.
 #
 # Auth strategy mirrors tier2-pin-e2e.sh: prefer DOCKPANEL_TEST_PASSWORD;
 # otherwise mint a short-lived admin JWT from /etc/dockpanel/api.env.
 #
-# The first PDF render lazy-installs typst into /var/lib/dockpanel/typst
-# (~30MB tarball, ~30s on a fresh box). Subsequent runs are instant.
-# Set CHAIN_REPORT_SKIP_PDF=1 to skip the PDF assertion (CI envs without
-# outbound HTTPS). Set CHAIN_REPORT_PDF_TIMEOUT to override the curl
-# timeout (default 90s) for the first-time install path.
+# typst lazy-installs on the first PDF render (~30MB tarball, ~30s on a
+# fresh box, sha256-pinned in v2.8.2). Subsequent runs hit the cached
+# binary. Set CHAIN_REPORT_SKIP_PDF=1 to skip PDF assertions on networks
+# without outbound HTTPS. CHAIN_REPORT_PDF_TIMEOUT overrides the curl
+# timeout (default 90s) for the first install.
 set -uo pipefail
 
 API="${DOCKPANEL_API_URL:-http://127.0.0.1:3080}"
@@ -70,11 +72,10 @@ if [ -z "$BEARER_TOKEN" ]; then
 fi
 
 AUTH=(-H "Authorization: Bearer $BEARER_TOKEN")
-
-# ── Auth gate ────────────────────────────────────────────────────────────
-sect "Authentication gate"
-
 BOGUS_UUID="00000000-0000-0000-0000-000000000000"
+
+# ── Auth gate (one kind covers the whole route — admin guard is shared) ──
+sect "Authentication gate"
 
 UNAUTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
     "$API/api/backup-orchestrator/chain-report/site/$BOGUS_UUID")
@@ -84,105 +85,110 @@ else
     red "Unauth NOT blocked (got $UNAUTH_STATUS)"
 fi
 
-# ── 404 on bogus id ──────────────────────────────────────────────────────
-sect "404 on missing backup"
+# ── Kind validation ──────────────────────────────────────────────────────
+sect "Kind validation"
 
-NOT_FOUND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${AUTH[@]}" \
-    "$API/api/backup-orchestrator/chain-report/site/$BOGUS_UUID")
-if [ "$NOT_FOUND_STATUS" = "404" ]; then
-    green "Bogus id returns 404"
+BAD_KIND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${AUTH[@]}" \
+    "$API/api/backup-orchestrator/chain-report/bogus/$BOGUS_UUID")
+if [ "$BAD_KIND_STATUS" = "400" ]; then
+    green "Bogus kind returns 400"
 else
-    red "Bogus id returned $NOT_FOUND_STATUS, expected 404"
+    red "Bogus kind returned $BAD_KIND_STATUS, expected 400"
 fi
 
-# ── Find a site backup to test against ───────────────────────────────────
-sect "Discover a site backup"
+# ── Per-kind assertions ──────────────────────────────────────────────────
+# Run the same shape of checks for every kind so any regression on one
+# kind shows up immediately. Each kind discovers a real backup row from
+# its respective table; if there's no fixture, the JSON+PDF assertions
+# for that kind are skipped (counts as 7 skips, not failures — used by
+# fresh-VPS runs where only one kind has been seeded).
 
-SITE_BACKUP_ID=$(psql_exec "SELECT id FROM backups ORDER BY created_at DESC LIMIT 1")
-if [ -z "$SITE_BACKUP_ID" ]; then
-    skip "No site backups exist on this host — JSON/PDF assertions skipped"
-    skip "JSON endpoint shape (no fixture)"
-    skip "PDF endpoint shape (no fixture)"
-    echo
-    echo "  Results: $PASS passed, $FAIL failed, $SKIP skipped ($TOTAL total)"
-    [ "$FAIL" -eq 0 ] && exit 0 || exit 1
-fi
-green "Found site backup: $SITE_BACKUP_ID"
+assert_kind() {
+    local kind="$1"
+    local table="$2"
+    sect "Kind: $kind"
 
-# ── JSON endpoint ────────────────────────────────────────────────────────
-sect "JSON endpoint"
+    BACKUP_ID=$(psql_exec "SELECT id FROM $table ORDER BY created_at DESC LIMIT 1")
+    if [ -z "$BACKUP_ID" ]; then
+        skip "$kind: no backup fixture (skip JSON + PDF block)"
+        for _ in $(seq 1 6); do skip "$kind: skipped (no fixture)"; done
+        return
+    fi
+    green "$kind: discovered backup $BACKUP_ID"
 
-JSON_BODY=$(curl -s -o /tmp/chain_report.json -w "%{http_code}" "${AUTH[@]}" \
-    "$API/api/backup-orchestrator/chain-report/site/$SITE_BACKUP_ID")
-if [ "$JSON_BODY" = "200" ]; then
-    green "JSON returns 200"
-else
-    red "JSON returned $JSON_BODY, expected 200"
-fi
+    # 404 on bogus id
+    NF=$(curl -s -o /dev/null -w "%{http_code}" "${AUTH[@]}" \
+        "$API/api/backup-orchestrator/chain-report/$kind/$BOGUS_UUID")
+    if [ "$NF" = "404" ]; then green "$kind: bogus id → 404"; else red "$kind: bogus id returned $NF (want 404)"; fi
 
-if grep -q '"panel_version"' /tmp/chain_report.json; then green "JSON has panel_version"; else red "JSON missing panel_version"; fi
-if grep -q '"generated_at"' /tmp/chain_report.json; then green "JSON has generated_at"; else red "JSON missing generated_at"; fi
-if grep -q '"backup"' /tmp/chain_report.json; then green "JSON has backup"; else red "JSON missing backup"; fi
-if grep -q '"verifications"' /tmp/chain_report.json; then green "JSON has verifications"; else red "JSON missing verifications"; fi
-if grep -q '"drills"' /tmp/chain_report.json; then green "JSON has drills"; else red "JSON missing drills"; fi
-if grep -q '"chain_integrity"' /tmp/chain_report.json; then green "JSON has chain_integrity"; else red "JSON missing chain_integrity"; fi
+    # JSON endpoint
+    JSON_OUT="/tmp/chain_report_${kind}.json"
+    JSON_STATUS=$(curl -s -o "$JSON_OUT" -w "%{http_code}" "${AUTH[@]}" \
+        "$API/api/backup-orchestrator/chain-report/$kind/$BACKUP_ID")
+    if [ "$JSON_STATUS" = "200" ]; then green "$kind: JSON 200"; else red "$kind: JSON returned $JSON_STATUS (want 200)"; fi
 
-# Backup id round-trip
-JSON_BACKUP_ID=$(python3 -c "import json,sys; print(json.load(open('/tmp/chain_report.json'))['backup']['id'])" 2>/dev/null || echo "")
-if [ "$JSON_BACKUP_ID" = "$SITE_BACKUP_ID" ]; then
-    green "JSON backup.id matches request"
-else
-    red "JSON backup.id mismatch (got '$JSON_BACKUP_ID')"
-fi
+    JSON_KIND=$(python3 -c "import json,sys; print(json.load(open('$JSON_OUT'))['backup']['kind'])" 2>/dev/null || echo "")
+    if [ "$JSON_KIND" = "$kind" ]; then green "$kind: JSON backup.kind matches"; else red "$kind: JSON backup.kind='$JSON_KIND' (want '$kind')"; fi
 
-# ── PDF endpoint ─────────────────────────────────────────────────────────
-sect "PDF endpoint"
+    JSON_BACKUP_ID=$(python3 -c "import json,sys; print(json.load(open('$JSON_OUT'))['backup']['id'])" 2>/dev/null || echo "")
+    if [ "$JSON_BACKUP_ID" = "$BACKUP_ID" ]; then green "$kind: JSON backup.id round-trips"; else red "$kind: JSON backup.id mismatch (got '$JSON_BACKUP_ID')"; fi
 
-if [ "${CHAIN_REPORT_SKIP_PDF:-0}" = "1" ]; then
-    skip "PDF assertion (CHAIN_REPORT_SKIP_PDF=1)"
-else
+    JSON_RESOURCE=$(python3 -c "import json,sys; print(json.load(open('$JSON_OUT'))['backup']['resource_name'])" 2>/dev/null || echo "")
+    if [ -n "$JSON_RESOURCE" ]; then green "$kind: resource_name non-empty ($JSON_RESOURCE)"; else red "$kind: resource_name empty"; fi
+
+    if grep -q '"chain_integrity"' "$JSON_OUT" && grep -q '"verifications"' "$JSON_OUT" && grep -q '"drills"' "$JSON_OUT"; then
+        green "$kind: JSON has chain_integrity / verifications / drills"
+    else
+        red "$kind: JSON missing one of chain_integrity / verifications / drills"
+    fi
+
+    # PDF endpoint
+    if [ "${CHAIN_REPORT_SKIP_PDF:-0}" = "1" ]; then
+        skip "$kind: PDF (CHAIN_REPORT_SKIP_PDF=1)"
+        return
+    fi
+
     PDF_HEADERS=$(curl -sI --max-time "$PDF_TIMEOUT" "${AUTH[@]}" \
-        "$API/api/backup-orchestrator/chain-report/site/$SITE_BACKUP_ID/pdf" 2>/dev/null)
+        "$API/api/backup-orchestrator/chain-report/$kind/$BACKUP_ID/pdf" 2>/dev/null)
     PDF_STATUS=$(echo "$PDF_HEADERS" | head -1 | grep -oP '\b\d{3}\b' | head -1)
 
     if [ "$PDF_STATUS" = "200" ]; then
-        green "PDF returns 200"
+        green "$kind: PDF 200"
+        if echo "$PDF_HEADERS" | grep -qi "content-type: application/pdf"; then
+            green "$kind: PDF Content-Type"
+        else
+            red "$kind: PDF Content-Type wrong/missing"
+        fi
+        if echo "$PDF_HEADERS" | grep -qi "content-disposition:.*attachment"; then
+            green "$kind: PDF Content-Disposition: attachment"
+        else
+            red "$kind: PDF Content-Disposition missing"
+        fi
+
+        PDF_OUT="/tmp/chain_report_${kind}.pdf"
+        curl -s --max-time "$PDF_TIMEOUT" -o "$PDF_OUT" "${AUTH[@]}" \
+            "$API/api/backup-orchestrator/chain-report/$kind/$BACKUP_ID/pdf" 2>/dev/null
+        if head -c 4 "$PDF_OUT" | grep -q "^%PDF"; then
+            green "$kind: PDF body has %PDF magic"
+        else
+            red "$kind: PDF body missing %PDF magic"
+        fi
+        SIZE=$(stat -c%s "$PDF_OUT" 2>/dev/null || echo 0)
+        if [ "$SIZE" -gt 1024 ]; then
+            green "$kind: PDF size > 1KB ($SIZE bytes)"
+        else
+            red "$kind: PDF suspiciously small ($SIZE bytes)"
+        fi
     elif [ "$PDF_STATUS" = "503" ]; then
-        skip "PDF returned 503 (typst install/compile failed — likely no outbound HTTPS)"
-        echo "  Results: $PASS passed, $FAIL failed, $SKIP skipped ($TOTAL total)"
-        [ "$FAIL" -eq 0 ] && exit 0 || exit 1
+        skip "$kind: PDF returned 503 (typst install/compile failed — likely no outbound HTTPS or sha256 mismatch)"
     else
-        red "PDF returned $PDF_STATUS, expected 200"
+        red "$kind: PDF returned $PDF_STATUS (want 200)"
     fi
+}
 
-    if echo "$PDF_HEADERS" | grep -qi "content-type: application/pdf"; then
-        green "PDF Content-Type is application/pdf"
-    else
-        red "PDF Content-Type missing or wrong"
-    fi
-
-    if echo "$PDF_HEADERS" | grep -qi "content-disposition:.*attachment"; then
-        green "PDF has Content-Disposition: attachment"
-    else
-        red "PDF missing Content-Disposition: attachment"
-    fi
-
-    curl -s --max-time "$PDF_TIMEOUT" -o /tmp/chain_report.pdf "${AUTH[@]}" \
-        "$API/api/backup-orchestrator/chain-report/site/$SITE_BACKUP_ID/pdf" 2>/dev/null
-
-    if head -c 4 /tmp/chain_report.pdf | grep -q "^%PDF"; then
-        green "PDF body starts with %PDF magic"
-    else
-        red "PDF body does not start with %PDF"
-    fi
-
-    PDF_SIZE=$(stat -c%s /tmp/chain_report.pdf 2>/dev/null || echo 0)
-    if [ "$PDF_SIZE" -gt 1024 ]; then
-        green "PDF size > 1KB ($PDF_SIZE bytes)"
-    else
-        red "PDF suspiciously small ($PDF_SIZE bytes)"
-    fi
-fi
+assert_kind site backups
+assert_kind database database_backups
+assert_kind volume volume_backups
 
 echo
 echo "  Results: $PASS passed, $FAIL failed, $SKIP skipped ($TOTAL total)"

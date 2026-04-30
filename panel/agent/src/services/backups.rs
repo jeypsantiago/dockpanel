@@ -89,7 +89,8 @@ pub async fn create_backup(domain: &str) -> Result<BackupInfo, String> {
 }
 
 /// Compute SHA256 hash of a file (for backup integrity chain).
-async fn compute_file_sha256(path: &str) -> Option<String> {
+/// Shared by site / database / volume backup paths.
+pub(crate) async fn compute_file_sha256(path: &str) -> Option<String> {
     let output = safe_command("sha256sum")
         .arg(path)
         .output()

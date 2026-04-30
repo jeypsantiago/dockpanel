@@ -64,17 +64,30 @@
 
 // ── Header ──────────────────────────────────────────────────────────────
 
+#let kind_label = if data.backup.kind == "site" { "Site" }
+  else if data.backup.kind == "database" { "Database" }
+  else if data.backup.kind == "volume" { "Volume" }
+  else { upper(data.backup.kind) }
+
 #align(left)[
   #text(size: 22pt, weight: "bold", fill: dp_brand)[DockPanel]
   #h(0.5em)
   #text(size: 14pt, fill: dp_dim, weight: "regular")[Chain-of-Trust Report]
+  #h(0.5em)
+  #text(size: 11pt, fill: dp_brand, weight: "bold")[· #upper(data.backup.kind)]
 ]
 
 #v(0.5em)
 #line(length: 100%, stroke: 0.5pt + dp_dim)
 #v(0.3em)
 
-#kv("Site", data.backup.site_name)
+#kv(kind_label, data.backup.resource_name)
+#if data.backup.kind == "database" and data.backup.db_type != none [
+  #kv("Engine", data.backup.db_type)
+]
+#if data.backup.kind == "volume" and data.backup.container_id != none [
+  #kv("Container ID", mono(data.backup.container_id))
+]
 #kv("Backup ID", mono(data.backup.id))
 #kv("Created", data.backup.created_at)
 #kv("Generated", data.generated_at)
@@ -175,10 +188,10 @@
 
 #v(2em)
 #text(size: 8pt, fill: dp_dim)[
-  This report is a point-in-time snapshot of one site backup and its full
-  verification + restore-drill history. Hashes are SHA-256 over the backup
-  artifact bytes. Chain validity links each backup to its predecessor; a
-  break in the chain indicates either a missing intermediate backup or a
-  tampered artifact. Restore drills end-to-end probe a real restore into
-  a scratch container.
+  This report is a point-in-time snapshot of one #lower(kind_label) backup
+  and its full verification + restore-drill history. Hashes are SHA-256 over
+  the backup artifact bytes. Chain validity links each backup to its
+  predecessor; a break in the chain indicates either a missing intermediate
+  backup or a tampered artifact. Restore drills end-to-end probe a real
+  restore into a scratch container.
 ]

@@ -12,7 +12,7 @@
 | **Sites** | Static, PHP (8.1-8.4), Node.js, Python sites with nginx. Domain rename, auto-firewall for proxy ports, Laravel auto-migrations | `routes/sites.rs`, `ssl.rs`, `files.rs`, `deploy.rs` | `nginx.rs`, `php.rs`, `ssl.rs`, `files.rs`, `cms.rs` | `Sites.tsx`, `SiteDetail.tsx`, `Files.tsx` | `sites` |
 | **Databases** | MySQL/PostgreSQL via Docker, SQL browser, schema viewer, password reset | `routes/databases.rs` | `database.rs` | `Databases.tsx` | `databases` |
 | **Backups** | Scheduled backups, S3/SFTP/B2/GCS remote storage, one-click restore | `routes/backups.rs`, `backup_schedules.rs`, `backup_destinations.rs` | `backups.rs`, `remote_backup.rs` | `Backups.tsx` | `backups`, `backup_schedules`, `backup_destinations` |
-| **Backup Orchestrator** | DB/volume/site backups, AES-256 encryption, restore verification, policies, health dashboard, auto-verifier, **fleet-wide unified view across all servers with server+kind filters**, **end-to-end restore drills (site/db/volume), Restore Confidence SLA card, chain-of-trust JSON+PDF report for site backups (v2.8.1)** | `routes/backup_orchestrator.rs` | `database_backup.rs`, `volume_backup.rs`, `encryption.rs`, `backup_verify.rs`, `backup_drills.rs`, `chain_report.rs` | `BackupOrchestrator.tsx` | `backup_policies`, `database_backups`, `volume_backups`, `backup_verifications`, `backup_drills` |
+| **Backup Orchestrator** | DB/volume/site backups, AES-256 encryption, restore verification, policies, health dashboard, auto-verifier, **fleet-wide unified view across all servers with server+kind filters**, **end-to-end restore drills (site/db/volume), Restore Confidence SLA card, chain-of-trust JSON+PDF report across site/db/volume backups with per-arch sha256-pinned typst (v2.8.2)** | `routes/backup_orchestrator.rs` | `database_backup.rs`, `volume_backup.rs`, `encryption.rs`, `backup_verify.rs`, `backup_drills.rs`, `chain_report.rs` | `BackupOrchestrator.tsx` | `backup_policies`, `database_backups`, `volume_backups`, `backup_verifications`, `backup_drills` |
 | **Webhook Gateway** | Receive, inspect, route, replay webhooks. HMAC-SHA256/SHA1 verification, JSON path filtering, retry with backoff, delivery logging | `routes/webhook_gateway.rs` | — | `WebhookGateway.tsx` | `webhook_endpoints`, `webhook_deliveries`, `webhook_routes` |
 | **Secrets Manager** | AES-256-GCM encrypted vaults, version history, auto-inject to .env, masked API, pull for CLI, vault rename | `routes/secrets.rs`, `services/secrets_crypto.rs` | — | `SecretsManager.tsx` | `secret_vaults`, `secrets`, `secret_versions` |
 | **Incident Management** | Incident lifecycle (investigating→resolved→postmortem), timeline updates, severity, affected components, postmortem | `routes/incidents.rs` | — | `IncidentManagement.tsx` | `managed_incidents`, `incident_updates`, `managed_incident_components` |
@@ -188,7 +188,7 @@
 | Full-stack RAM (with bundled PostgreSQL) | ~85 MB | 2026-04-15 |
 | App templates | 152 (14 categories) | 2026-03-28 |
 | API endpoints | 776 (496 backend + 280 agent) | 2026-04-30 |
-| E2E tests | 432 (10 test suites incl. tier2-pin + chain-report sub-suites) | 2026-04-30 |
+| E2E tests | 454 (10 test suites incl. tier2-pin + chain-report-all-kinds sub-suites) | 2026-04-30 |
 | Frontend pages | 51 | 2026-04-14 |
-| DB migrations | 88 | 2026-04-30 |
+| DB migrations | 89 | 2026-04-30 |
 | Background services | 11 | 2026-03-22 |

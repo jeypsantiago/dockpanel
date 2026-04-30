@@ -883,8 +883,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/backup-orchestrator/verifications", get(backup_orchestrator::list_verifications))
         .route("/api/backup-orchestrator/drill", post(backup_orchestrator::trigger_drill))
         .route("/api/backup-orchestrator/drills", get(backup_orchestrator::list_drills))
-        .route("/api/backup-orchestrator/chain-report/site/{id}", get(backup_orchestrator::chain_report_site_json))
-        .route("/api/backup-orchestrator/chain-report/site/{id}/pdf", get(backup_orchestrator::chain_report_site_pdf))
+        .route("/api/backup-orchestrator/chain-report/{kind}/{id}", get(backup_orchestrator::chain_report_json))
+        .route("/api/backup-orchestrator/chain-report/{kind}/{id}/pdf", get(backup_orchestrator::chain_report_pdf))
         .route("/api/backup-orchestrator/storage-history", get(backup_orchestrator::storage_history))
         // Webhook Gateway
         .route("/api/webhook-gateway/endpoints", get(webhook_gateway::list_endpoints).post(webhook_gateway::create_endpoint))

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use crate::safe_cmd::safe_command;
 
-use super::backups::BackupInfo;
+use super::backups::{BackupInfo, compute_file_sha256};
 
 const BACKUP_DIR: &str = "/var/backups/dockpanel/volumes";
 
@@ -67,14 +67,17 @@ pub async fn backup_volume(
     let meta = std::fs::metadata(&filepath)
         .map_err(|e| format!("Failed to read backup metadata: {e}"))?;
 
-    tracing::info!("Volume backup created: {filename} ({} bytes)", meta.len());
+    let filepath_str = filepath.to_str().ok_or("Invalid path encoding")?;
+    let sha256 = compute_file_sha256(filepath_str).await;
+
+    tracing::info!("Volume backup created: {filename} ({} bytes, hash: {})", meta.len(), sha256.as_deref().unwrap_or("N/A"));
 
     Ok(BackupInfo {
         filename,
         size_bytes: meta.len(),
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            sha256: None,
-        })
+        sha256,
+    })
 }
 
 /// Restore a Docker volume from a backup.

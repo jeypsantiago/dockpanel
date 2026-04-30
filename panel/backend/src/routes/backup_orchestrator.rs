@@ -74,6 +74,9 @@ pub struct DatabaseBackup {
     pub encrypted: bool,
     pub uploaded: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub sha256_hash: Option<String>,
+    pub previous_hash: Option<String>,
+    pub chain_valid: Option<bool>,
 }
 
 #[derive(serde::Serialize, sqlx::FromRow)]
@@ -88,6 +91,9 @@ pub struct VolumeBackup {
     pub encrypted: bool,
     pub uploaded: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub sha256_hash: Option<String>,
+    pub previous_hash: Option<String>,
+    pub chain_valid: Option<bool>,
 }
 
 #[derive(serde::Serialize, sqlx::FromRow)]
@@ -786,12 +792,20 @@ pub async fn create_db_backup(
     let size_bytes = result.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
     let encrypted = encryption_key.is_some();
 
+    // v2.8.2: integrity chain — same pattern as routes/backups.rs for site backups.
+    let sha256_hash = result.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let previous_hash: Option<String> = sqlx::query_scalar(
+        "SELECT sha256_hash FROM database_backups WHERE database_id = $1 ORDER BY created_at DESC LIMIT 1"
+    ).bind(db_id).fetch_optional(&state.db).await.unwrap_or(None);
+
     let backup: DatabaseBackup = sqlx::query_as(
-        "INSERT INTO database_backups (database_id, server_id, filename, size_bytes, db_type, db_name, encrypted) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *"
+        "INSERT INTO database_backups (database_id, server_id, filename, size_bytes, db_type, db_name, encrypted, sha256_hash, previous_hash, chain_valid) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE) RETURNING *"
     )
     .bind(db_id).bind(server_id).bind(&filename).bind(size_bytes)
     .bind(&engine).bind(&db_name).bind(encrypted)
+    .bind(if sha256_hash.is_empty() { None } else { Some(&sha256_hash) })
+    .bind(previous_hash.as_deref())
     .fetch_one(&state.db).await
     .map_err(|e| internal_error("create db backup", e))?;
 
@@ -978,12 +992,21 @@ pub async fn create_volume_backup(
         "SELECT id FROM servers WHERE status = 'online' LIMIT 1"
     ).fetch_optional(&state.db).await.unwrap_or(None);
 
+    // v2.8.2: integrity chain. Scope previous_hash by (container_id, volume_name)
+    // so re-creating the same logical volume re-chains rather than forking.
+    let sha256_hash = result.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let previous_hash: Option<String> = sqlx::query_scalar(
+        "SELECT sha256_hash FROM volume_backups WHERE container_id = $1 AND volume_name = $2 ORDER BY created_at DESC LIMIT 1"
+    ).bind(&req.container_id).bind(&req.volume_name).fetch_optional(&state.db).await.unwrap_or(None);
+
     let backup: VolumeBackup = sqlx::query_as(
-        "INSERT INTO volume_backups (container_id, container_name, server_id, volume_name, filename, size_bytes) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *"
+        "INSERT INTO volume_backups (container_id, container_name, server_id, volume_name, filename, size_bytes, sha256_hash, previous_hash, chain_valid) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE) RETURNING *"
     )
     .bind(&req.container_id).bind(&req.container_name).bind(server_id)
     .bind(&req.volume_name).bind(&filename).bind(size_bytes)
+    .bind(if sha256_hash.is_empty() { None } else { Some(&sha256_hash) })
+    .bind(previous_hash.as_deref())
     .fetch_one(&state.db).await
     .map_err(|e| internal_error("create volume backup", e))?;
 
@@ -1383,22 +1406,31 @@ pub async fn list_drills(
 
 // ── Chain-of-Trust Report (Phase 4 W1.3) ────────────────────────────────────
 //
-// Site-only for v2.8.1 — `backups.sha256_hash`/`previous_hash`/`chain_valid`
-// columns exist on the site backup table (migration 20260324000000); the db +
-// volume tables don't carry hashes yet. v2.8.2 extends this once those
-// migrations land + the agent computes hashes during db/volume backup.
+// v2.8.1 shipped site-only. v2.8.2 extends to db + volume after migration
+// 20260430200000 added `sha256_hash`/`previous_hash`/`chain_valid` to those
+// tables, and the agent now computes SHA-256 during db_backup + volume_backup.
+// Single `build_chain_report(kind, id)` dispatches on table; the typst template
+// branches on `backup.kind` to render the right resource label.
 
 #[derive(serde::Serialize)]
 pub struct ChainReportBackup {
+    /// One of "site" | "database" | "volume". The typst template branches on this.
+    pub kind: String,
     pub id: Uuid,
-    pub site_id: Uuid,
-    pub site_name: String,
+    /// Domain for site, db_name for database, "container:volume" for volume.
+    pub resource_name: String,
     pub filename: String,
     pub size_bytes: i64,
     pub sha256_hash: Option<String>,
     pub previous_hash: Option<String>,
     pub chain_valid: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    // Kind-specific extras — exactly one set is populated, the others are None.
+    pub site_id: Option<Uuid>,
+    pub database_id: Option<Uuid>,
+    pub container_id: Option<String>,
+    pub volume_name: Option<String>,
+    pub db_type: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -1444,36 +1476,123 @@ pub struct ChainReport {
     pub chain_integrity: ChainIntegrity,
 }
 
-/// Build a site chain-of-trust report from the database. Returns 404 if the
-/// backup doesn't exist. Single point of truth for both JSON and PDF endpoints.
-async fn build_site_chain_report(
+/// Validate the {kind} URL segment. Returns the canonical lowercase value or
+/// 400 if the kind is unknown. Kept centralised so the JSON + PDF handlers
+/// don't drift.
+fn parse_chain_kind(kind: &str) -> Result<&'static str, ApiError> {
+    match kind {
+        "site" => Ok("site"),
+        "database" => Ok("database"),
+        "volume" => Ok("volume"),
+        _ => Err(err(StatusCode::BAD_REQUEST, "kind must be one of: site, database, volume")),
+    }
+}
+
+/// Build a chain-of-trust report for any backup kind. Returns 404 if the
+/// backup doesn't exist. Single point of truth for the JSON + PDF endpoints.
+///
+/// v2.8.2: refactored from build_site_chain_report. Backup-row shape varies
+/// per kind so each branch issues its own SELECT; the verifications/drills
+/// queries are uniform — they just take `backup_type` as a parameter.
+async fn build_chain_report(
     state: &AppState,
+    kind: &'static str,
     backup_id: Uuid,
 ) -> Result<ChainReport, ApiError> {
-    let row: Option<(
-        Uuid,                                       // id
-        Uuid,                                       // site_id
-        String,                                     // site_name (domain)
-        String,                                     // filename
-        i64,                                        // size_bytes
-        Option<String>,                             // sha256_hash
-        Option<String>,                             // previous_hash
-        Option<bool>,                               // chain_valid (DEFAULT TRUE but column is nullable)
-        chrono::DateTime<chrono::Utc>,              // created_at
-    )> = sqlx::query_as(
-        "SELECT b.id, b.site_id, s.domain, b.filename, b.size_bytes, \
-                b.sha256_hash, b.previous_hash, b.chain_valid, b.created_at \
-           FROM backups b JOIN sites s ON s.id = b.site_id \
-          WHERE b.id = $1"
-    )
-    .bind(backup_id)
-    .fetch_optional(&state.db).await
-    .map_err(|e| internal_error("chain report: load backup", e))?;
+    let backup = match kind {
+        "site" => {
+            let row: Option<(
+                Uuid, Uuid, String, String, i64,
+                Option<String>, Option<String>, Option<bool>,
+                chrono::DateTime<chrono::Utc>,
+            )> = sqlx::query_as(
+                "SELECT b.id, b.site_id, s.domain, b.filename, b.size_bytes, \
+                        b.sha256_hash, b.previous_hash, b.chain_valid, b.created_at \
+                   FROM backups b JOIN sites s ON s.id = b.site_id \
+                  WHERE b.id = $1"
+            )
+            .bind(backup_id)
+            .fetch_optional(&state.db).await
+            .map_err(|e| internal_error("chain report: load site backup", e))?;
 
-    let (id, site_id, site_name, filename, size_bytes, sha256_hash, previous_hash, chain_valid, created_at) =
-        row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
+            let (id, site_id, resource_name, filename, size_bytes, sha256_hash, previous_hash, chain_valid, created_at) =
+                row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
 
-    let chain_valid = chain_valid.unwrap_or(true);
+            ChainReportBackup {
+                kind: "site".into(),
+                id, resource_name, filename, size_bytes,
+                sha256_hash, previous_hash,
+                chain_valid: chain_valid.unwrap_or(true),
+                created_at,
+                site_id: Some(site_id),
+                database_id: None, container_id: None, volume_name: None, db_type: None,
+            }
+        }
+        "database" => {
+            let row: Option<(
+                Uuid, Uuid, String, String, String, i64,
+                Option<String>, Option<String>, Option<bool>,
+                chrono::DateTime<chrono::Utc>,
+            )> = sqlx::query_as(
+                "SELECT id, database_id, db_name, db_type, filename, size_bytes, \
+                        sha256_hash, previous_hash, chain_valid, created_at \
+                   FROM database_backups \
+                  WHERE id = $1"
+            )
+            .bind(backup_id)
+            .fetch_optional(&state.db).await
+            .map_err(|e| internal_error("chain report: load database backup", e))?;
+
+            let (id, database_id, resource_name, db_type, filename, size_bytes, sha256_hash, previous_hash, chain_valid, created_at) =
+                row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
+
+            ChainReportBackup {
+                kind: "database".into(),
+                id, resource_name, filename, size_bytes,
+                sha256_hash, previous_hash,
+                chain_valid: chain_valid.unwrap_or(true),
+                created_at,
+                site_id: None,
+                database_id: Some(database_id),
+                container_id: None, volume_name: None,
+                db_type: Some(db_type),
+            }
+        }
+        "volume" => {
+            let row: Option<(
+                Uuid, String, String, String, String, i64,
+                Option<String>, Option<String>, Option<bool>,
+                chrono::DateTime<chrono::Utc>,
+            )> = sqlx::query_as(
+                "SELECT id, container_id, container_name, volume_name, filename, size_bytes, \
+                        sha256_hash, previous_hash, chain_valid, created_at \
+                   FROM volume_backups \
+                  WHERE id = $1"
+            )
+            .bind(backup_id)
+            .fetch_optional(&state.db).await
+            .map_err(|e| internal_error("chain report: load volume backup", e))?;
+
+            let (id, container_id, container_name, volume_name, filename, size_bytes, sha256_hash, previous_hash, chain_valid, created_at) =
+                row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Backup not found"))?;
+
+            ChainReportBackup {
+                kind: "volume".into(),
+                id,
+                resource_name: format!("{container_name}:{volume_name}"),
+                filename, size_bytes,
+                sha256_hash, previous_hash,
+                chain_valid: chain_valid.unwrap_or(true),
+                created_at,
+                site_id: None, database_id: None,
+                container_id: Some(container_id),
+                volume_name: Some(volume_name),
+                db_type: None,
+            }
+        }
+        // parse_chain_kind already gates this — defensive only.
+        _ => return Err(err(StatusCode::BAD_REQUEST, "Unsupported backup kind")),
+    };
 
     let verifications_rows: Vec<(
         Uuid, String, i32, i32, Option<i32>,
@@ -1485,9 +1604,10 @@ async fn build_site_chain_report(
         "SELECT id, status, checks_run, checks_passed, duration_ms, \
                 started_at, completed_at, created_at, error_message \
            FROM backup_verifications \
-          WHERE backup_type = 'site' AND backup_id = $1 \
+          WHERE backup_type = $1 AND backup_id = $2 \
           ORDER BY created_at ASC"
     )
+    .bind(kind)
     .bind(backup_id)
     .fetch_all(&state.db).await
     .map_err(|e| internal_error("chain report: load verifications", e))?;
@@ -1502,9 +1622,10 @@ async fn build_site_chain_report(
         "SELECT id, status, http_status, body_excerpt, duration_ms, \
                 started_at, completed_at, created_at, error_message \
            FROM backup_drills \
-          WHERE backup_type = 'site' AND backup_id = $1 \
+          WHERE backup_type = $1 AND backup_id = $2 \
           ORDER BY created_at ASC"
     )
+    .bind(kind)
     .bind(backup_id)
     .fetch_all(&state.db).await
     .map_err(|e| internal_error("chain report: load drills", e))?;
@@ -1529,14 +1650,12 @@ async fn build_site_chain_report(
 
     let verifications_passed = verifications.iter().filter(|v| v.status == "passed").count() as i64;
     let drills_passed = drills.iter().filter(|d| d.status == "passed").count() as i64;
+    let chain_valid = backup.chain_valid;
 
     Ok(ChainReport {
         panel_version: env!("CARGO_PKG_VERSION").to_string(),
         generated_at: chrono::Utc::now(),
-        backup: ChainReportBackup {
-            id, site_id, site_name, filename, size_bytes,
-            sha256_hash, previous_hash, chain_valid, created_at,
-        },
+        backup,
         verifications,
         drills,
         chain_integrity: ChainIntegrity {
@@ -1569,27 +1688,30 @@ fn slug(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// GET /api/backup-orchestrator/chain-report/site/{id} — Chain-of-trust JSON
-/// for one site backup. Single artifact, full provenance chain (backup
-/// integrity hashes + every verification + every restore drill).
-pub async fn chain_report_site_json(
+/// GET /api/backup-orchestrator/chain-report/{kind}/{id} — Chain-of-trust
+/// JSON for one backup of any kind (site | database | volume). Single
+/// artifact, full provenance chain (backup integrity hashes + every
+/// verification + every restore drill).
+pub async fn chain_report_json(
     State(state): State<AppState>,
     AdminUser(_claims): AdminUser,
-    Path(id): Path<Uuid>,
+    Path((kind, id)): Path<(String, Uuid)>,
 ) -> Result<Json<ChainReport>, ApiError> {
-    let report = build_site_chain_report(&state, id).await?;
+    let kind = parse_chain_kind(&kind)?;
+    let report = build_chain_report(&state, kind, id).await?;
     Ok(Json(report))
 }
 
-/// GET /api/backup-orchestrator/chain-report/site/{id}/pdf — Chain-of-trust
+/// GET /api/backup-orchestrator/chain-report/{kind}/{id}/pdf — Chain-of-trust
 /// PDF rendered via typst. First call lazy-installs typst into
 /// /var/lib/dockpanel/typst (~30MB, one-time). 503 if install/compile fails.
-pub async fn chain_report_site_pdf(
+pub async fn chain_report_pdf(
     State(state): State<AppState>,
     AdminUser(_claims): AdminUser,
-    Path(id): Path<Uuid>,
+    Path((kind, id)): Path<(String, Uuid)>,
 ) -> Result<axum::response::Response, ApiError> {
-    let report = build_site_chain_report(&state, id).await?;
+    let kind = parse_chain_kind(&kind)?;
+    let report = build_chain_report(&state, kind, id).await?;
     let json_value = serde_json::to_value(&report)
         .map_err(|e| internal_error("chain report: serialize", e))?;
 
@@ -1601,8 +1723,9 @@ pub async fn chain_report_site_pdf(
         })?;
 
     let filename = format!(
-        "chain-report-{}-{}.pdf",
-        slug(&report.backup.site_name),
+        "chain-report-{}-{}-{}.pdf",
+        report.backup.kind,
+        slug(&report.backup.resource_name),
         short_id(report.backup.id),
     );
 

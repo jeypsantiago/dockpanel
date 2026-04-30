@@ -203,12 +203,19 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
                     let size_bytes = resp.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
                     let encrypted = encryption_key.is_some();
 
+                    let sha256_hash = resp.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let previous_hash: Option<String> = sqlx::query_scalar(
+                        "SELECT sha256_hash FROM database_backups WHERE database_id = $1 ORDER BY created_at DESC LIMIT 1"
+                    ).bind(db_id).fetch_optional(db).await.unwrap_or(None);
+
                     let _ = sqlx::query(
-                        "INSERT INTO database_backups (database_id, server_id, filename, size_bytes, db_type, db_name, encrypted, policy_id) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+                        "INSERT INTO database_backups (database_id, server_id, filename, size_bytes, db_type, db_name, encrypted, policy_id, sha256_hash, previous_hash, chain_valid) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)"
                     )
                     .bind(db_id).bind(policy.server_id).bind(&filename).bind(size_bytes)
                     .bind(engine).bind(db_name).bind(encrypted).bind(policy.id)
+                    .bind(if sha256_hash.is_empty() { None } else { Some(&sha256_hash) })
+                    .bind(previous_hash.as_deref())
                     .execute(db).await;
 
                     successes += 1;
@@ -256,12 +263,19 @@ async fn execute_policy(db: &PgPool, agent: &AgentClient, policy: &PolicyRow, jw
                                             let filename = resp.get("filename").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                             let size_bytes = resp.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
 
+                                            let sha256_hash = resp.get("sha256").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            let previous_hash: Option<String> = sqlx::query_scalar(
+                                                "SELECT sha256_hash FROM volume_backups WHERE container_id = $1 AND volume_name = $2 ORDER BY created_at DESC LIMIT 1"
+                                            ).bind(container_id).bind(vol_name).fetch_optional(db).await.unwrap_or(None);
+
                                             let _ = sqlx::query(
-                                                "INSERT INTO volume_backups (container_id, container_name, server_id, volume_name, filename, size_bytes, policy_id) \
-                                                 VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                                                "INSERT INTO volume_backups (container_id, container_name, server_id, volume_name, filename, size_bytes, policy_id, sha256_hash, previous_hash, chain_valid) \
+                                                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)"
                                             )
                                             .bind(container_id).bind(container_name).bind(policy.server_id)
                                             .bind(vol_name).bind(&filename).bind(size_bytes).bind(policy.id)
+                                            .bind(if sha256_hash.is_empty() { None } else { Some(&sha256_hash) })
+                                            .bind(previous_hash.as_deref())
                                             .execute(db).await;
 
                                             successes += 1;

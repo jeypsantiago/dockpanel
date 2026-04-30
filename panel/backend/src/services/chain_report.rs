@@ -1,8 +1,10 @@
 // Chain-of-trust report rendering: lazy-install typst CLI on first use, then
 // transform a ChainReport JSON into a PDF via the bundled .typ template.
 //
-// Phase 4 W1.3 (v2.8.1). Site-only for now; v2.8.2 extends to db+volume once
-// those tables get sha256_hash columns.
+// Phase 4 W1.3 shipped site-only in v2.8.1. v2.8.2 extends to db + volume
+// (the route handlers + builder are in routes/backup_orchestrator.rs) and
+// adds SHA-256 pinning of the typst tarball — TLS + github.com is no longer
+// the sole trust anchor.
 
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -11,8 +13,16 @@ use tokio::sync::Mutex;
 const TYPST_VERSION: &str = "0.13.0";
 const TYPST_DIR: &str = "/var/lib/dockpanel/typst";
 const TYPST_BIN: &str = "/var/lib/dockpanel/typst/typst";
-const INSTALL_TIMEOUT_SECS: u64 = 90;
+const INSTALL_TIMEOUT_SECS: u64 = 120;
 const COMPILE_TIMEOUT_SECS: u64 = 30;
+
+// Pinned tarball SHA-256s for typst v0.13.0 (verified against
+// github.com/typst/typst/releases/download/v0.13.0/, 2026-04-30).
+// If TYPST_VERSION above is bumped, regenerate these.
+const TYPST_SHA256_X86_64_MUSL: &str =
+    "cd1148da61d6844e62c330fc6222e988480acafe33b76daec8eb5d221258feb6";
+const TYPST_SHA256_AARCH64_MUSL: &str =
+    "1a1b3841ee1d84d130c4fd58f1ac8a23acf0d6bf11161c5246f016622cf046e6";
 
 // Embedded so the binary is self-contained; written to a tempfile per render.
 const TEMPLATE_TYP: &str = include_str!("../../templates/chain-report.typ");
@@ -37,24 +47,37 @@ pub async fn ensure_typst_installed() -> Result<PathBuf, String> {
         .await
         .map_err(|e| format!("create typst dir: {e}"))?;
 
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
+    let (arch, expected_sha) = match std::env::consts::ARCH {
+        "x86_64" => ("x86_64", TYPST_SHA256_X86_64_MUSL),
+        "aarch64" => ("aarch64", TYPST_SHA256_AARCH64_MUSL),
         other => return Err(format!("unsupported arch for typst: {other}")),
     };
+
+    // Allow operators to override the pinned digest if they're using a
+    // different typst version (e.g. air-gapped mirror). Same env per arch.
+    let env_key = format!("DOCKPANEL_TYPST_SHA256_{}", arch.to_uppercase());
+    let expected_sha = std::env::var(&env_key).unwrap_or_else(|_| expected_sha.to_string());
 
     let target = format!("{arch}-unknown-linux-musl");
     let url = format!(
         "https://github.com/typst/typst/releases/download/v{TYPST_VERSION}/typst-{target}.tar.xz"
     );
 
-    // Stream the tarball through `tar -xJ` straight into the install dir.
-    // No tempfile, no sha256 (matches the existing grype installer pattern;
-    // TLS + github.com is the trust anchor). v2.8.2 should add checksum pinning.
+    // Two-phase install: download to tempfile → verify sha256 → extract.
+    // Adds ~30MB temp + a second pass over the bytes; runs once per host.
+    // Refusing to extract a tarball whose checksum doesn't match the pin is
+    // the whole point — never let `tar` see unverified bytes.
     let cmd = format!(
         "set -euo pipefail; \
-         curl -sSfL --max-time 60 '{url}' \
-           | tar -xJf - -C '{TYPST_DIR}' --strip-components=1 'typst-{target}/typst'; \
+         tmp=$(mktemp '{TYPST_DIR}/typst-download.XXXXXX.tar.xz'); \
+         trap 'rm -f \"$tmp\"' EXIT; \
+         curl -sSfL --max-time 90 -o \"$tmp\" '{url}'; \
+         actual=$(sha256sum \"$tmp\" | awk '{{print $1}}'); \
+         if [ \"$actual\" != '{expected_sha}' ]; then \
+           echo \"typst sha256 mismatch: expected {expected_sha}, got $actual\" >&2; \
+           exit 99; \
+         fi; \
+         tar -xJf \"$tmp\" -C '{TYPST_DIR}' --strip-components=1 'typst-{target}/typst'; \
          chmod 755 '{TYPST_BIN}'"
     );
 
@@ -68,6 +91,10 @@ pub async fn ensure_typst_installed() -> Result<PathBuf, String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Surface the sha256 mismatch separately so it doesn't get buried.
+        if output.status.code() == Some(99) {
+            return Err(format!("typst install aborted on sha256 mismatch: {stderr}"));
+        }
         return Err(format!("typst install failed: {stderr}"));
     }
 

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use crate::safe_cmd::safe_command;
 
-use super::backups::BackupInfo;
+use super::backups::{BackupInfo, compute_file_sha256};
 
 const BACKUP_DIR: &str = "/var/backups/dockpanel/databases";
 
@@ -128,13 +128,16 @@ pub async fn dump_mysql(
         return Err("Database dump produced empty output".to_string());
     }
 
-    tracing::info!("MySQL dump created: {filename} ({} bytes)", meta.len());
+    let filepath_str = filepath.to_str().ok_or("Invalid path encoding")?;
+    let sha256 = compute_file_sha256(filepath_str).await;
+
+    tracing::info!("MySQL dump created: {filename} ({} bytes, hash: {})", meta.len(), sha256.as_deref().unwrap_or("N/A"));
 
     Ok(BackupInfo {
         filename,
         size_bytes: meta.len(),
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        sha256: None,
+        sha256,
     })
 }
 
@@ -231,13 +234,16 @@ pub async fn dump_postgres(
         return Err("Database dump produced empty output".to_string());
     }
 
-    tracing::info!("PostgreSQL dump created: {filename} ({} bytes)", meta.len());
+    let filepath_str = filepath.to_str().ok_or("Invalid path encoding")?;
+    let sha256 = compute_file_sha256(filepath_str).await;
+
+    tracing::info!("PostgreSQL dump created: {filename} ({} bytes, hash: {})", meta.len(), sha256.as_deref().unwrap_or("N/A"));
 
     Ok(BackupInfo {
         filename,
         size_bytes: meta.len(),
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        sha256: None,
+        sha256,
     })
 }
 
@@ -303,13 +309,16 @@ pub async fn dump_mongo(
         return Err("Database dump produced empty output".to_string());
     }
 
-    tracing::info!("MongoDB dump created: {filename} ({} bytes)", meta.len());
+    let filepath_str = filepath.to_str().ok_or("Invalid path encoding")?;
+    let sha256 = compute_file_sha256(filepath_str).await;
+
+    tracing::info!("MongoDB dump created: {filename} ({} bytes, hash: {})", meta.len(), sha256.as_deref().unwrap_or("N/A"));
 
     Ok(BackupInfo {
         filename,
         size_bytes: meta.len(),
         created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        sha256: None,
+        sha256,
     })
 }
 

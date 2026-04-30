@@ -6,6 +6,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.2] - 2026-04-30
+
+### Added
+
+- **Chain-of-trust report extended to database + volume backups.**
+  v2.8.1 shipped site-only because only the `backups` table carried
+  integrity-hash columns. v2.8.2 lands the matching migration
+  (`20260430200000_db_volume_backup_hashes.sql`) — `sha256_hash`,
+  `previous_hash`, and `chain_valid` on both `database_backups` and
+  `volume_backups`, applied in a single transaction so a partial apply
+  can't leave one table chained and the other not. The agent now
+  computes SHA-256 on every database dump (mysql / postgres / mongo) and
+  every volume tarball, and the backend persists the hash + previous-hash
+  link on the same INSERT path that lands the new backup row — both the
+  on-demand routes (`POST /api/backup-orchestrator/db-backup` /
+  `volume-backup`) and the policy-executor scheduled path. The All
+  Backups tab now shows the `Report | JSON | PDF` 3-segment control on
+  every row regardless of kind.
+
+  The chain-report routes were collapsed from kind-specific
+  (`/chain-report/site/{id}[/pdf]`) into one generic shape:
+  - `GET /api/backup-orchestrator/chain-report/{kind}/{id}` — JSON.
+  - `GET /api/backup-orchestrator/chain-report/{kind}/{id}/pdf` — PDF.
+
+  `{kind}` ∈ `{site, database, volume}`; bogus kinds 400 cleanly. The
+  JSON `backup` object now carries `kind` plus optional kind-specific
+  fields (`database_id`, `container_id`, `volume_name`, `db_type`); the
+  former `site_name` field was renamed to `resource_name` (domain for
+  site, db_name for database, `container:volume` for volume) so the same
+  consumer can render any kind. `build_site_chain_report` →
+  `build_chain_report(kind, id)` with table-name dispatch. The typst
+  template is now a single file that branches on `data.backup.kind` for
+  the resource label and kind-specific extras (db engine, container ID),
+  so the three kinds can't drift apart.
+
+- **typst tarball SHA-256 pinning.** v2.8.1 trusted GitHub TLS for the
+  v0.13.0 musl tarball (matching the existing grype installer). v2.8.2
+  pins the per-arch SHA-256 (`x86_64-unknown-linux-musl`:
+  `cd1148da…feb6`, `aarch64-unknown-linux-musl`: `1a1b3841…46e6`),
+  verified at install time before `tar` ever sees the bytes. Operators
+  can override per arch via `DOCKPANEL_TYPST_SHA256_X86_64` /
+  `_AARCH64` env vars (e.g. air-gapped mirror, custom typst version).
+  Mismatch surfaces as a distinct error rather than a generic install
+  failure. Install timeout bumped 90 → 120 s to absorb the second pass
+  over the bytes.
+
+### Tests
+
+- **`tests/chain-report-e2e.sh` extended to all three kinds.** The site
+  block became a kind-agnostic `assert_kind` helper; the suite now
+  iterates `site → database → volume` and runs the same shape of
+  assertions per kind (auth gate, kind validation, 404 on bogus id,
+  JSON 200, JSON `backup.kind` + `backup.id` + `backup.resource_name`
+  round-trip + shape, PDF 200 + Content-Type + Content-Disposition
+  + %PDF magic + size > 1 KB). Fixtures are discovered per kind from
+  `backups` / `database_backups` / `volume_backups`; missing fixtures
+  skip rather than fail (so CI hosts that haven't seeded volume backups
+  still green-light). Total suite ~50 assertions.
+
 ## [2.8.1] - 2026-04-30
 
 ### Added
