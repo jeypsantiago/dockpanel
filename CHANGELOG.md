@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-05-01
+
 ### Added
 
 - **Restore Confidence SLA card on Backup Orchestrator overview** (Phase 4
@@ -87,7 +89,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   on both `schedule` and `drill_schedule` writes (was previously
   unchecked on `schedule` too — small hardening win). W1.2 (engines +
   scheduler) is now complete; W1.3 (chain-of-trust PDF/JSON export)
-  is the remaining Phase 4 slice before tagging v2.8.0.
+  ships separately as v2.8.1.
+
+### Polish
+
+- **Backup Orchestrator UX pass**. Drills tab now paginates with
+  `Prev`/`Next` (50 per page) instead of silently truncating to the
+  first 100; backend `GET /api/backup-orchestrator/drills` returns
+  `{items, total}` to drive it. Result column is tone-coded for site
+  drills — HTTP 2xx rust, 3xx neutral, 4xx amber, 5xx danger — so
+  failures jump out at a glance. Running drills get a pulsing dot in
+  the status pill and a `N running` counter + manual `Refresh` button
+  above the table. Created column shows relative time with the
+  absolute timestamp on hover. Drill button on DB and volume rows now
+  asks once before spending — a confirm/cancel pair appears with the
+  cost hint (`boots a 256 MB scratch DB engine, ~60s` /
+  `boots a 128 MB scratch container + temp volume, ~60s`); site drills
+  fire directly since they're cheap.
+- **Image scan + SBOM Settings cards** (a25c716). Apps CVE drawer +
+  Settings ImageScan/SBOM cards picked up the same dialog/a11y polish
+  as the rest of the panel: `role="dialog"` + `aria-modal` + Esc to
+  close on the scan drawer, `type="button"` + `aria-label` on every
+  trigger, design-system tokens (no raw Tailwind colors), explicit
+  load-error + Retry on the Settings cards (no more stuck "Loading…"),
+  `Last scan Xh ago · N images on file` derived from
+  `/image-scan/recent` when the scanner is installed, and an explicit
+  `On-demand only — no schedule, no deploy gate` line on the SBOM
+  card so the configuration model is unambiguous.
 
 ## [2.7.20] - 2026-04-28
 

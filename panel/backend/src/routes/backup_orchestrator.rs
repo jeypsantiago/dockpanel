@@ -1350,20 +1350,30 @@ pub async fn trigger_drill(
     Ok((StatusCode::ACCEPTED, Json(drill)))
 }
 
-/// GET /api/backup-orchestrator/drills — List drills.
+#[derive(serde::Serialize)]
+pub struct DrillsResponse {
+    pub items: Vec<BackupDrill>,
+    pub total: i64,
+}
+
+/// GET /api/backup-orchestrator/drills — List drills (paginated).
 pub async fn list_drills(
     State(state): State<AppState>,
     AdminUser(_claims): AdminUser,
     Query(params): Query<PaginationQuery>,
-) -> Result<Json<Vec<BackupDrill>>, ApiError> {
+) -> Result<Json<DrillsResponse>, ApiError> {
     let (limit, offset) = paginate(params.limit, params.offset);
 
-    let drills: Vec<BackupDrill> = sqlx::query_as(
+    let items: Vec<BackupDrill> = sqlx::query_as(
         "SELECT * FROM backup_drills ORDER BY created_at DESC LIMIT $1 OFFSET $2"
     )
     .bind(limit).bind(offset)
     .fetch_all(&state.db).await
     .map_err(|e| internal_error("list drills", e))?;
 
-    Ok(Json(drills))
+    let (total,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM backup_drills")
+        .fetch_one(&state.db).await
+        .map_err(|e| internal_error("list drills count", e))?;
+
+    Ok(Json(DrillsResponse { items, total }))
 }

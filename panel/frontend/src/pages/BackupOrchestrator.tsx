@@ -50,6 +50,11 @@ interface Drill {
   created_at: string;
 }
 
+interface DrillsResponse {
+  items: Drill[];
+  total: number;
+}
+
 interface BackupPolicy {
   id: string;
   name: string;
@@ -160,6 +165,7 @@ interface Database {
 type Tab = "overview" | "all" | "policies" | "databases" | "volumes" | "verifications" | "drills" | "destinations";
 
 const ALL_PAGE_SIZE = 50;
+const DRILLS_PAGE_SIZE = 50;
 
 export default function BackupOrchestrator() {
   const { user } = useAuth();
@@ -170,7 +176,9 @@ export default function BackupOrchestrator() {
   const [dbBackups, setDbBackups] = useState<DatabaseBackup[]>([]);
   const [volBackups, setVolBackups] = useState<VolumeBackup[]>([]);
   const [verifications, setVerifications] = useState<Verification[]>([]);
-  const [drills, setDrills] = useState<Drill[]>([]);
+  const [drillsData, setDrillsData] = useState<DrillsResponse>({ items: [], total: 0 });
+  const [drillsOffset, setDrillsOffset] = useState(0);
+  const [drillsLoading, setDrillsLoading] = useState(false);
   const [destinations, setDestinations] = useState<Destination[]>([]);
   const [databases, setDatabases] = useState<Database[]>([]);
   const [servers, setServers] = useState<ServerRow[]>([]);
@@ -200,7 +208,7 @@ export default function BackupOrchestrator() {
         api.get<DatabaseBackup[]>("/backup-orchestrator/db-backups").catch(() => []),
         api.get<VolumeBackup[]>("/backup-orchestrator/volume-backups").catch(() => []),
         api.get<Verification[]>("/backup-orchestrator/verifications").catch(() => []),
-        api.get<Drill[]>("/backup-orchestrator/drills").catch(() => []),
+        api.get<DrillsResponse>(`/backup-orchestrator/drills?limit=${DRILLS_PAGE_SIZE}&offset=0`).catch(() => ({ items: [], total: 0 })),
         api.get<Destination[]>("/backup-destinations").catch(() => []),
         api.get<Database[]>("/databases").catch(() => []),
         api.get<ServerRow[]>("/servers").catch(() => []),
@@ -210,7 +218,8 @@ export default function BackupOrchestrator() {
       setDbBackups(db);
       setVolBackups(vol);
       setVerifications(ver);
-      setDrills(drl);
+      setDrillsData(drl);
+      setDrillsOffset(0);
       setDestinations(dest);
       setDatabases(dbs);
       setServers(srv);
@@ -244,6 +253,21 @@ export default function BackupOrchestrator() {
     if (tab === "all") loadUnified(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, unifiedFilterServer, unifiedFilterKind]);
+
+  const loadDrills = async (offset = 0) => {
+    setDrillsLoading(true);
+    try {
+      const res = await api.get<DrillsResponse>(
+        `/backup-orchestrator/drills?limit=${DRILLS_PAGE_SIZE}&offset=${offset}`
+      );
+      setDrillsData(res);
+      setDrillsOffset(offset);
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : "Failed to load drills", type: "error" });
+    } finally {
+      setDrillsLoading(false);
+    }
+  };
 
   const createPolicy = async () => {
     try {
@@ -381,7 +405,16 @@ export default function BackupOrchestrator() {
       )}
       {tab === "volumes" && <VolumesTab backups={volBackups} onVerify={triggerVerify} />}
       {tab === "verifications" && <VerificationsTab verifications={verifications} />}
-      {tab === "drills" && <DrillsTab drills={drills} />}
+      {tab === "drills" && (
+        <DrillsTab
+          data={drillsData}
+          loading={drillsLoading}
+          offset={drillsOffset}
+          pageSize={DRILLS_PAGE_SIZE}
+          onPage={loadDrills}
+          onRefresh={() => loadDrills(drillsOffset)}
+        />
+      )}
       {tab === "destinations" && (
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
           <div className="px-5 py-3 border-b border-dark-600">
@@ -593,8 +626,28 @@ function AllBackupsTab({
   onPage: (offset: number) => void;
   onDrill: (backupId: string, backupType: "site" | "database" | "volume") => void;
 }) {
+  const [pendingDrillId, setPendingDrillId] = useState<string | null>(null);
   const hasNext = offset + data.items.length < data.total;
   const hasPrev = offset > 0;
+
+  const drillCostHint = (kind: UnifiedBackupRow["kind"]): string => {
+    if (kind === "site") return "";
+    if (kind === "database") return "boots a 256 MB scratch DB engine, ~60s";
+    return "boots a 128 MB scratch container + temp volume, ~60s";
+  };
+
+  const handleDrillClick = (row: UnifiedBackupRow) => {
+    if (row.kind === "site") {
+      onDrill(row.id, row.kind);
+      return;
+    }
+    if (pendingDrillId === row.id) {
+      onDrill(row.id, row.kind);
+      setPendingDrillId(null);
+    } else {
+      setPendingDrillId(row.id);
+    }
+  };
 
   const kindBadge = (kind: UnifiedBackupRow["kind"]) => {
     const style = kind === "site"
@@ -695,20 +748,38 @@ function AllBackupsTab({
                       <div className="text-[10px] text-dark-300">{timeAgo(row.created_at)}</div>
                     </td>
                     <td className="px-4 py-2 text-right">
-                      <button
-                        type="button"
-                        onClick={() => onDrill(row.id, row.kind as "site" | "database" | "volume")}
-                        className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-rust-400 border border-rust-500/30 rounded"
-                        title={
-                          row.kind === "site"
-                            ? "Restore into a scratch nginx and probe HTTP — proves the backup is actually deployable"
-                          : row.kind === "database"
-                            ? "Boot a scratch engine, restore the dump, count rows — proves the backup is actually queryable"
-                            : "Restore into a scratch Docker volume + read-test through a probe container — proves the backup is actually mountable"
-                        }
-                      >
-                        Drill
-                      </button>
+                      {pendingDrillId === row.id ? (
+                        <div className="inline-flex items-center gap-1.5">
+                          <span className="text-[10px] text-dark-300 font-mono mr-1" title={drillCostHint(row.kind)}>
+                            {drillCostHint(row.kind)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleDrillClick(row)}
+                            className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-rust-500/10 hover:bg-rust-500/20 text-rust-400 border border-rust-500/40 rounded"
+                          >Confirm</button>
+                          <button
+                            type="button"
+                            onClick={() => setPendingDrillId(null)}
+                            className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-dark-200 rounded"
+                          >Cancel</button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => handleDrillClick(row)}
+                          className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-rust-400 border border-rust-500/30 rounded"
+                          title={
+                            row.kind === "site"
+                              ? "Restore into a scratch nginx and probe HTTP — proves the backup is actually deployable"
+                            : row.kind === "database"
+                              ? "Boot a scratch engine, restore the dump, count rows — proves the backup is actually queryable"
+                              : "Restore into a scratch Docker volume + read-test through a probe container — proves the backup is actually mountable"
+                          }
+                        >
+                          Drill
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -1054,50 +1125,133 @@ function VerificationsTab({ verifications }: { verifications: Verification[] }) 
 
 // ── Drills Tab (Phase 4 W1.2: end-to-end restore probes) ──────────────────
 
-function DrillsTab({ drills }: { drills: Drill[] }) {
-  const resultCell = (d: Drill) => {
-    if (d.backup_type === "site") {
-      return d.http_status != null ? `HTTP ${d.http_status}` : "—";
-    }
-    // database + volume: body_excerpt holds the row/table or file/byte summary
-    return d.body_excerpt ?? "—";
-  };
+function httpTone(code: number): string {
+  if (code >= 200 && code < 300) return "text-rust-400";
+  if (code >= 300 && code < 400) return "text-dark-100";
+  if (code >= 400 && code < 500) return "text-warn-400";
+  if (code >= 500) return "text-danger-400";
+  return "text-dark-200";
+}
 
-  return drills.length === 0 ? (
-    <div className="p-12 text-center">
-      <p className="text-dark-200 text-sm font-mono">No drills yet</p>
-      <p className="text-dark-300 text-xs mt-1 font-mono">Click <span className="text-rust-400">Drill</span> on any backup in the All Backups tab to do a real end-to-end restore probe.</p>
-    </div>
-  ) : (
-    <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto">
-      <table className="w-full">
-        <thead>
-          <tr className="bg-dark-900 border-b border-dark-500">
-            {["Type", "Status", "Result", "Duration", "Error", "Created"].map(h => (
-              <th key={h} className="text-left text-xs font-medium text-dark-200 uppercase font-mono tracking-widest px-5 py-3">{h}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-dark-600">
-          {drills.map(d => (
-            <tr key={d.id} className="hover:bg-dark-700/30 transition-colors">
-              <td className="px-5 py-4 text-sm text-dark-50 font-mono capitalize">{d.backup_type}</td>
-              <td className="px-5 py-4">
-                <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium font-mono ${
-                  d.status === "passed" ? "bg-rust-500/15 text-rust-400"
-                  : d.status === "failed" ? "bg-danger-500/15 text-danger-400"
-                  : d.status === "running" ? "bg-warn-500/15 text-warn-400"
-                  : "bg-dark-700 text-dark-200"
-                }`}>{d.status}</span>
-              </td>
-              <td className="px-5 py-4 text-sm text-dark-200 font-mono truncate max-w-[200px]" title={d.body_excerpt ?? ""}>{resultCell(d)}</td>
-              <td className="px-5 py-4 text-sm text-dark-200 font-mono">{d.duration_ms ? `${(d.duration_ms / 1000).toFixed(1)}s` : "—"}</td>
-              <td className="px-5 py-4 text-xs text-danger-400 font-mono truncate max-w-[240px]" title={d.error_message ?? ""}>{d.error_message || "—"}</td>
-              <td className="px-5 py-4 text-xs text-dark-300 font-mono">{formatDate(d.created_at)}</td>
+function ResultCell({ drill }: { drill: Drill }) {
+  if (drill.backup_type === "site") {
+    if (drill.http_status == null) return <span className="text-dark-300">—</span>;
+    return <span className={`font-mono ${httpTone(drill.http_status)}`}>HTTP {drill.http_status}</span>;
+  }
+  // database + volume: body_excerpt holds the row/table or file/byte summary
+  return (
+    <span className="text-dark-100 font-mono">
+      {drill.body_excerpt ?? <span className="text-dark-300">—</span>}
+    </span>
+  );
+}
+
+function DrillStatusPill({ status }: { status: string }) {
+  const tone =
+    status === "passed" ? "bg-rust-500/15 text-rust-400"
+    : status === "failed" ? "bg-danger-500/15 text-danger-400"
+    : status === "running" ? "bg-warn-500/15 text-warn-400"
+    : "bg-dark-700 text-dark-200";
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium font-mono ${tone}`}>
+      {status === "running" && (
+        <span className="relative flex h-1.5 w-1.5" aria-hidden="true">
+          <span className="absolute inline-flex h-full w-full rounded-full bg-warn-400 opacity-60 animate-ping" />
+          <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-warn-400" />
+        </span>
+      )}
+      {status}
+    </span>
+  );
+}
+
+function DrillsTab({
+  data, loading, offset, pageSize, onPage, onRefresh,
+}: {
+  data: DrillsResponse;
+  loading: boolean;
+  offset: number;
+  pageSize: number;
+  onPage: (offset: number) => void;
+  onRefresh: () => void;
+}) {
+  const hasNext = offset + data.items.length < data.total;
+  const hasPrev = offset > 0;
+  const hasRunning = data.items.some(d => d.status === "running");
+
+  if (data.items.length === 0 && !loading) {
+    return (
+      <div className="p-12 text-center">
+        <p className="text-dark-200 text-sm font-mono">No drills yet</p>
+        <p className="text-dark-300 text-xs mt-1 font-mono">Click <span className="text-rust-400">Drill</span> on any backup in the All Backups tab to do a real end-to-end restore probe.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between text-xs font-mono text-dark-300">
+        <span>
+          {loading ? "Loading…" : `${data.total.toLocaleString()} total`}
+          {hasRunning && !loading && <span className="ml-2 text-warn-400">· {data.items.filter(d => d.status === "running").length} running</span>}
+        </span>
+        {hasRunning && (
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={loading}
+            className="px-2.5 py-1 text-[10px] uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-dark-100 rounded disabled:opacity-40"
+          >Refresh</button>
+        )}
+      </div>
+
+      <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto">
+        <table className="w-full">
+          <thead>
+            <tr className="bg-dark-900 border-b border-dark-500">
+              {["Type", "Status", "Result", "Duration", "Error", "Created"].map(h => (
+                <th key={h} className="text-left text-xs font-medium text-dark-200 uppercase font-mono tracking-widest px-5 py-3">{h}</th>
+              ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody className="divide-y divide-dark-600">
+            {data.items.map(d => (
+              <tr key={d.id} className="hover:bg-dark-700/30 transition-colors">
+                <td className="px-5 py-4 text-sm text-dark-50 font-mono capitalize">{d.backup_type}</td>
+                <td className="px-5 py-4"><DrillStatusPill status={d.status} /></td>
+                <td className="px-5 py-4 text-sm truncate max-w-[260px]" title={d.body_excerpt ?? ""}>
+                  <ResultCell drill={d} />
+                </td>
+                <td className="px-5 py-4 text-sm text-dark-200 font-mono">{d.duration_ms ? `${(d.duration_ms / 1000).toFixed(1)}s` : "—"}</td>
+                <td className="px-5 py-4 text-xs text-danger-400 font-mono truncate max-w-[240px]" title={d.error_message ?? ""}>{d.error_message || "—"}</td>
+                <td className="px-5 py-4 text-xs text-dark-300 font-mono" title={formatDate(d.created_at)}>{timeAgo(d.created_at)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {(hasPrev || hasNext) && (
+        <div className="flex justify-between items-center text-xs font-mono text-dark-300">
+          <span>
+            Showing {offset + 1}–{offset + data.items.length} of {data.total.toLocaleString()}
+          </span>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => onPage(Math.max(0, offset - pageSize))}
+              disabled={!hasPrev || loading}
+              className="px-3 py-1 bg-dark-700 hover:bg-dark-600 disabled:opacity-40 disabled:cursor-not-allowed text-dark-100 rounded"
+            >Prev</button>
+            <button
+              type="button"
+              onClick={() => onPage(offset + pageSize)}
+              disabled={!hasNext || loading}
+              className="px-3 py-1 bg-dark-700 hover:bg-dark-600 disabled:opacity-40 disabled:cursor-not-allowed text-dark-100 rounded"
+            >Next</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
