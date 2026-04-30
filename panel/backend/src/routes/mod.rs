@@ -881,6 +881,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/backup-orchestrator/volume-backups/{id}/restore", post(backup_orchestrator::restore_volume_backup))
         .route("/api/backup-orchestrator/verify", post(backup_orchestrator::trigger_verify))
         .route("/api/backup-orchestrator/verifications", get(backup_orchestrator::list_verifications))
+        .route("/api/backup-orchestrator/drill", post(backup_orchestrator::trigger_drill))
+        .route("/api/backup-orchestrator/drills", get(backup_orchestrator::list_drills))
         .route("/api/backup-orchestrator/storage-history", get(backup_orchestrator::storage_history))
         // Webhook Gateway
         .route("/api/webhook-gateway/endpoints", get(webhook_gateway::list_endpoints).post(webhook_gateway::create_endpoint))

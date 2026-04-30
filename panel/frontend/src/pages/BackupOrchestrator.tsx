@@ -32,6 +32,22 @@ interface BackupHealth {
   verify_lag_p50_hours: number | null;
   verify_lag_p95_hours: number | null;
   per_server_sla: ServerSla[];
+  drills_passed_30d: number;
+  drills_failed_30d: number;
+}
+
+interface Drill {
+  id: string;
+  backup_type: string;
+  backup_id: string;
+  status: string;
+  http_status: number | null;
+  body_excerpt: string | null;
+  error_message: string | null;
+  duration_ms: number | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
 }
 
 interface BackupPolicy {
@@ -136,7 +152,7 @@ interface Database {
   engine: string;
 }
 
-type Tab = "overview" | "all" | "policies" | "databases" | "volumes" | "verifications" | "destinations";
+type Tab = "overview" | "all" | "policies" | "databases" | "volumes" | "verifications" | "drills" | "destinations";
 
 const ALL_PAGE_SIZE = 50;
 
@@ -149,6 +165,7 @@ export default function BackupOrchestrator() {
   const [dbBackups, setDbBackups] = useState<DatabaseBackup[]>([]);
   const [volBackups, setVolBackups] = useState<VolumeBackup[]>([]);
   const [verifications, setVerifications] = useState<Verification[]>([]);
+  const [drills, setDrills] = useState<Drill[]>([]);
   const [destinations, setDestinations] = useState<Destination[]>([]);
   const [databases, setDatabases] = useState<Database[]>([]);
   const [servers, setServers] = useState<ServerRow[]>([]);
@@ -171,12 +188,13 @@ export default function BackupOrchestrator() {
   const loadAll = async () => {
     setLoading(true);
     try {
-      const [h, p, db, vol, ver, dest, dbs, srv] = await Promise.all([
+      const [h, p, db, vol, ver, drl, dest, dbs, srv] = await Promise.all([
         api.get<BackupHealth>("/backup-orchestrator/health").catch(() => null),
         api.get<BackupPolicy[]>("/backup-orchestrator/policies").catch(() => []),
         api.get<DatabaseBackup[]>("/backup-orchestrator/db-backups").catch(() => []),
         api.get<VolumeBackup[]>("/backup-orchestrator/volume-backups").catch(() => []),
         api.get<Verification[]>("/backup-orchestrator/verifications").catch(() => []),
+        api.get<Drill[]>("/backup-orchestrator/drills").catch(() => []),
         api.get<Destination[]>("/backup-destinations").catch(() => []),
         api.get<Database[]>("/databases").catch(() => []),
         api.get<ServerRow[]>("/servers").catch(() => []),
@@ -186,6 +204,7 @@ export default function BackupOrchestrator() {
       setDbBackups(db);
       setVolBackups(vol);
       setVerifications(ver);
+      setDrills(drl);
       setDestinations(dest);
       setDatabases(dbs);
       setServers(srv);
@@ -265,6 +284,17 @@ export default function BackupOrchestrator() {
     }
   };
 
+  const triggerDrill = async (backupId: string) => {
+    try {
+      await api.post("/backup-orchestrator/drill", { backup_type: "site", backup_id: backupId });
+      setMessage({ text: "Drill started — restoring into a scratch container, this can take 30s", type: "success" });
+      setTimeout(loadAll, 8000);
+      setTimeout(loadAll, 30000);
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" });
+    }
+  };
+
   const tabs: { key: Tab; label: string }[] = [
     { key: "overview", label: "Overview" },
     { key: "all", label: "All Backups" },
@@ -272,6 +302,7 @@ export default function BackupOrchestrator() {
     { key: "databases", label: "DB Backups" },
     { key: "volumes", label: "Volume Backups" },
     { key: "verifications", label: "Verifications" },
+    { key: "drills", label: "Drills" },
     { key: "destinations", label: "Destinations" },
   ];
 
@@ -320,6 +351,7 @@ export default function BackupOrchestrator() {
           setFilterServer={setUnifiedFilterServer}
           setFilterKind={setUnifiedFilterKind}
           onPage={loadUnified}
+          onDrill={triggerDrill}
         />
       )}
       {tab === "policies" && (
@@ -336,6 +368,7 @@ export default function BackupOrchestrator() {
       )}
       {tab === "volumes" && <VolumesTab backups={volBackups} onVerify={triggerVerify} />}
       {tab === "verifications" && <VerificationsTab verifications={verifications} />}
+      {tab === "drills" && <DrillsTab drills={drills} />}
       {tab === "destinations" && (
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
           <div className="px-5 py-3 border-b border-dark-600">
@@ -479,6 +512,21 @@ function SlaCard({ health }: { health: BackupHealth }) {
         </div>
       )}
 
+      {(health.drills_passed_30d > 0 || health.drills_failed_30d > 0) && total > 0 && (
+        <div className="px-5 py-2 border-t border-dark-600 text-[10px] font-mono flex items-center justify-between">
+          <span className="text-dark-300 uppercase tracking-widest">End-to-end drills (30d)</span>
+          <span className="text-dark-100">
+            <span className="text-rust-400">{health.drills_passed_30d} passed</span>
+            {health.drills_failed_30d > 0 && (
+              <>
+                <span className="text-dark-400 mx-1.5">·</span>
+                <span className="text-danger-400">{health.drills_failed_30d} failed</span>
+              </>
+            )}
+          </span>
+        </div>
+      )}
+
       {showServers && (
         <div className="border-t border-dark-600">
           <div className="px-5 py-2 text-[10px] text-dark-300 uppercase font-mono tracking-widest">Per server (last 30d)</div>
@@ -518,7 +566,7 @@ function SlaStat({ label, value, tone }: { label: string; value: string; tone?: 
 
 function AllBackupsTab({
   data, servers, loading, offset, pageSize,
-  filterServer, filterKind, setFilterServer, setFilterKind, onPage,
+  filterServer, filterKind, setFilterServer, setFilterKind, onPage, onDrill,
 }: {
   data: UnifiedBackupsResponse;
   servers: ServerRow[];
@@ -530,6 +578,7 @@ function AllBackupsTab({
   setFilterServer: (s: string) => void;
   setFilterKind: (k: "" | "site" | "database" | "volume") => void;
   onPage: (offset: number) => void;
+  onDrill: (backupId: string) => void;
 }) {
   const hasNext = offset + data.items.length < data.total;
   const hasPrev = offset > 0;
@@ -598,6 +647,7 @@ function AllBackupsTab({
                   <th className="px-4 py-2 text-left">Server</th>
                   <th className="px-4 py-2 text-left">Size</th>
                   <th className="px-4 py-2 text-left">Created</th>
+                  <th className="px-4 py-2 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-dark-600">
@@ -630,6 +680,20 @@ function AllBackupsTab({
                     <td className="px-4 py-2 text-dark-200 font-mono">
                       <div>{formatDate(row.created_at)}</div>
                       <div className="text-[10px] text-dark-300">{timeAgo(row.created_at)}</div>
+                    </td>
+                    <td className="px-4 py-2 text-right">
+                      {row.kind === "site" ? (
+                        <button
+                          type="button"
+                          onClick={() => onDrill(row.id)}
+                          className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-rust-400 border border-rust-500/30 rounded"
+                          title="Restore into a scratch container and probe HTTP — proves the backup is actually deployable"
+                        >
+                          Drill
+                        </button>
+                      ) : (
+                        <span className="text-[10px] text-dark-400 font-mono" title="Drill engine for database/volume backups ships in a later release">—</span>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -939,6 +1003,48 @@ function VerificationsTab({ verifications }: { verifications: Verification[] }) 
               <td className="px-5 py-4 text-sm text-dark-200 font-mono">{v.duration_ms ? `${v.duration_ms}ms` : "-"}</td>
               <td className="px-5 py-4 text-xs text-danger-400 font-mono truncate max-w-[200px]">{v.error_message || "-"}</td>
               <td className="px-5 py-4 text-xs text-dark-300 font-mono">{formatDate(v.created_at)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Drills Tab (Phase 4 W1.2: end-to-end restore probes) ──────────────────
+
+function DrillsTab({ drills }: { drills: Drill[] }) {
+  return drills.length === 0 ? (
+    <div className="p-12 text-center">
+      <p className="text-dark-200 text-sm font-mono">No drills yet</p>
+      <p className="text-dark-300 text-xs mt-1 font-mono">Click <span className="text-rust-400">Drill</span> on any site backup in the All Backups tab to do a real end-to-end restore probe.</p>
+    </div>
+  ) : (
+    <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto">
+      <table className="w-full">
+        <thead>
+          <tr className="bg-dark-900 border-b border-dark-500">
+            {["Type", "Status", "HTTP", "Duration", "Error", "Created"].map(h => (
+              <th key={h} className="text-left text-xs font-medium text-dark-200 uppercase font-mono tracking-widest px-5 py-3">{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-dark-600">
+          {drills.map(d => (
+            <tr key={d.id} className="hover:bg-dark-700/30 transition-colors">
+              <td className="px-5 py-4 text-sm text-dark-50 font-mono capitalize">{d.backup_type}</td>
+              <td className="px-5 py-4">
+                <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium font-mono ${
+                  d.status === "passed" ? "bg-rust-500/15 text-rust-400"
+                  : d.status === "failed" ? "bg-danger-500/15 text-danger-400"
+                  : d.status === "running" ? "bg-warn-500/15 text-warn-400"
+                  : "bg-dark-700 text-dark-200"
+                }`}>{d.status}</span>
+              </td>
+              <td className="px-5 py-4 text-sm text-dark-200 font-mono">{d.http_status ?? "—"}</td>
+              <td className="px-5 py-4 text-sm text-dark-200 font-mono">{d.duration_ms ? `${(d.duration_ms / 1000).toFixed(1)}s` : "—"}</td>
+              <td className="px-5 py-4 text-xs text-danger-400 font-mono truncate max-w-[240px]" title={d.error_message ?? ""}>{d.error_message || "—"}</td>
+              <td className="px-5 py-4 text-xs text-dark-300 font-mono">{formatDate(d.created_at)}</td>
             </tr>
           ))}
         </tbody>

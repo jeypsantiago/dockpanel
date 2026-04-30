@@ -1,6 +1,7 @@
 pub mod app_process;
 pub mod command_filter;
 pub mod backups;
+pub mod backup_drill;
 pub mod backup_verify;
 pub mod cms;
 pub mod compose;

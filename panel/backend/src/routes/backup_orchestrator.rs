@@ -94,6 +94,23 @@ pub struct BackupVerification {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct BackupDrill {
+    pub id: Uuid,
+    pub backup_type: String,
+    pub backup_id: Uuid,
+    pub server_id: Option<Uuid>,
+    pub triggered_by: Option<Uuid>,
+    pub status: String,
+    pub http_status: Option<i32>,
+    pub body_excerpt: Option<String>,
+    pub error_message: Option<String>,
+    pub duration_ms: Option<i32>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(serde::Deserialize)]
 pub struct PaginationQuery {
     pub limit: Option<i64>,
@@ -157,6 +174,9 @@ pub struct BackupHealth {
     pub verify_lag_p50_hours: Option<f64>,
     pub verify_lag_p95_hours: Option<f64>,
     pub per_server_sla: Vec<ServerSla>,
+    // Drill counts (Phase 4 W1.2): end-to-end restore probes in last 30d.
+    pub drills_passed_30d: i64,
+    pub drills_failed_30d: i64,
 }
 
 #[derive(serde::Serialize)]
@@ -440,6 +460,17 @@ pub async fn health(
         })
         .collect();
 
+    // Drill counts (last 30d).
+    let (drills_passed_30d, drills_failed_30d): (i64, i64) = sqlx::query_as(
+        "SELECT \
+            COUNT(*) FILTER (WHERE status = 'passed')::bigint, \
+            COUNT(*) FILTER (WHERE status = 'failed')::bigint \
+         FROM backup_drills \
+         WHERE created_at > NOW() - INTERVAL '30 days'"
+    )
+    .fetch_one(db).await
+    .unwrap_or((0, 0));
+
     Ok(Json(BackupHealth {
         total_site_backups: total_site,
         total_db_backups: total_db,
@@ -460,6 +491,8 @@ pub async fn health(
         verify_lag_p50_hours: lag_p50,
         verify_lag_p95_hours: lag_p95,
         per_server_sla,
+        drills_passed_30d,
+        drills_failed_30d,
     }))
 }
 
@@ -1145,4 +1178,109 @@ pub async fn list_verifications(
     .map_err(|e| internal_error("list verifications", e))?;
 
     Ok(Json(verifications))
+}
+
+// ── Drills (Phase 4 W1.2: end-to-end restore probes) ────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct DrillRequest {
+    pub backup_type: String, // site (only kind supported in W1.2; db/volume come later)
+    pub backup_id: Uuid,
+}
+
+/// POST /api/backup-orchestrator/drill — Trigger an on-demand backup drill.
+/// Currently supports `backup_type = "site"`; database and volume drills are
+/// W1.2.b / W1.2.c and will land in subsequent sessions.
+pub async fn trigger_drill(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+    Json(req): Json<DrillRequest>,
+) -> Result<(StatusCode, Json<BackupDrill>), ApiError> {
+    if req.backup_type != "site" {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "Only site drills are implemented in this version (db + volume drills coming soon)",
+        ));
+    }
+
+    // Insert pending drill record so the UI gets immediate feedback.
+    let drill: BackupDrill = sqlx::query_as(
+        "INSERT INTO backup_drills (backup_type, backup_id, triggered_by, status, started_at) \
+         VALUES ($1, $2, $3, 'running', NOW()) RETURNING *"
+    )
+    .bind(&req.backup_type).bind(req.backup_id).bind(claims.sub)
+    .fetch_one(&state.db).await
+    .map_err(|e| internal_error("trigger drill", e))?;
+
+    let drill_id = drill.id;
+    let db = state.db.clone();
+    let backup_id = req.backup_id;
+
+    // Run drill async — the agent call can take 20-30s (extract + nginx start + probe).
+    tokio::spawn(async move {
+        let row = sqlx::query_as::<_, (String, String)>(
+            "SELECT s.domain, b.filename FROM backups b \
+             JOIN sites s ON s.id = b.site_id WHERE b.id = $1"
+        ).bind(backup_id).fetch_optional(&db).await;
+
+        let result: Result<serde_json::Value, String> = match row {
+            Ok(Some((domain, filename))) => {
+                let body = serde_json::json!({ "domain": domain, "filename": filename });
+                agent.post("/backups/drill/site", Some(body)).await.map_err(|e| e.to_string())
+            }
+            Ok(None) => Err("Site backup not found".to_string()),
+            Err(e) => {
+                tracing::warn!("DB error fetching site backup for drill: {e}");
+                Err(format!("Database error: {e}"))
+            }
+        };
+
+        match result {
+            Ok(data) => {
+                let passed = data.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
+                let http_status = data.get("http_status").and_then(|v| v.as_i64()).map(|n| n as i32);
+                let body_excerpt = data.get("body_excerpt").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let error_message = data.get("error_message").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let duration_ms = data.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
+                let _ = sqlx::query(
+                    "UPDATE backup_drills SET \
+                     status = $2, http_status = $3, body_excerpt = $4, \
+                     error_message = $5, duration_ms = $6, completed_at = NOW() \
+                     WHERE id = $1"
+                )
+                .bind(drill_id)
+                .bind(if passed { "passed" } else { "failed" })
+                .bind(http_status).bind(body_excerpt)
+                .bind(error_message).bind(duration_ms)
+                .execute(&db).await;
+            }
+            Err(e) => {
+                let _ = sqlx::query(
+                    "UPDATE backup_drills SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1"
+                ).bind(drill_id).bind(&e).execute(&db).await;
+            }
+        }
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(drill)))
+}
+
+/// GET /api/backup-orchestrator/drills — List drills.
+pub async fn list_drills(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    Query(params): Query<PaginationQuery>,
+) -> Result<Json<Vec<BackupDrill>>, ApiError> {
+    let (limit, offset) = paginate(params.limit, params.offset);
+
+    let drills: Vec<BackupDrill> = sqlx::query_as(
+        "SELECT * FROM backup_drills ORDER BY created_at DESC LIMIT $1 OFFSET $2"
+    )
+    .bind(limit).bind(offset)
+    .fetch_all(&state.db).await
+    .map_err(|e| internal_error("list drills", e))?;
+
+    Ok(Json(drills))
 }

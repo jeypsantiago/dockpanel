@@ -150,6 +150,7 @@ async fn main() {
         .merge(routes::database_backup::router())
         .merge(routes::volume_backup::router())
         .merge(routes::backup_verify::router())
+        .merge(routes::backup_drill::router())
         .merge(routes::deploy::router())
         .merge(routes::git_build::router())
         .merge(routes::smtp::router())

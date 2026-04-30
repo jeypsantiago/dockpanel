@@ -21,6 +21,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (previously declared but never populated), and `per_server_sla[]`.
   Latest verification per (backup type, backup id) wins, so re-runs
   supersede stale entries. No schema migration; same endpoint URL.
+- **End-to-end backup drills for site backups** (Phase 4 W1.2 part A).
+  Click `Drill` on any site row in the All Backups tab — the agent extracts
+  the tar to a scratch directory, spins a hardened `nginx:alpine` container
+  (`--network none`, `--read-only`, 128MB / 0.5 CPU caps), HTTP-probes
+  `localhost/` via `docker exec wget`, and tears everything down. Persisted
+  in a new `backup_drills` table; visible in the new Drills tab with status,
+  HTTP code, duration, and error message. SLA card on Overview gains a
+  "End-to-end drills (30d): N passed · M failed" line when drills exist.
+  New endpoints: `POST /api/backup-orchestrator/drill` (admin, async — returns
+  202 immediately, drill row updates as the agent finishes) and
+  `GET /api/backup-orchestrator/drills` (paginated history). Agent endpoint
+  `POST /backups/drill/site`. Database and volume drill engines come in
+  W1.2.b/c — non-site rows show `—` for now with a tooltip explaining.
 
 ## [2.7.20] - 2026-04-28
 
