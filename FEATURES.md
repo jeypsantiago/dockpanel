@@ -1,6 +1,6 @@
 # DockPanel Feature Manifest
 
-> **Last verified**: 2026-04-16 | **Version**: v2.7.17 | **Total**: 60+ major features, ~280 capabilities
+> **Last verified**: 2026-05-01 | **Version**: v2.8.0 | **Total**: 60+ major features, ~285 capabilities
 >
 > This file is the single source of truth for what DockPanel offers.
 > Update it whenever features are added, changed, or removed.
@@ -187,8 +187,8 @@
 | Panel services RAM (agent + API) | ~19 MB | 2026-04-15 |
 | Full-stack RAM (with bundled PostgreSQL) | ~85 MB | 2026-04-15 |
 | App templates | 152 (14 categories) | 2026-03-28 |
-| API endpoints | 733 (465 backend + 268 agent) | 2026-03-31 |
-| E2E tests | 425 (8 test suites) | 2026-04-14 |
+| API endpoints | 760 (490 backend + 270 agent) | 2026-05-01 |
+| E2E tests | 426 (9 test suites incl. tier2-pin sub-suite) | 2026-05-01 |
 | Frontend pages | 51 | 2026-04-14 |
 | DB migrations | 81 | 2026-03-31 |
 | Background services | 11 | 2026-03-22 |

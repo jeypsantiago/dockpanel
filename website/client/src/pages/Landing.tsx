@@ -73,7 +73,7 @@ function AnimatedTerminal() {
           { text: '  Configuring nginx & PostgreSQL...', cls: 'text-zinc-600', delay: 500 },
           { text: '  Starting services...', cls: 'text-zinc-600', delay: 400 },
           { text: '\u00A0', cls: '', delay: 250 },
-          { text: '\u2713 DockPanel v2.7.4 installed in 47s', cls: 'text-emerald-400 font-medium', delay: 350 },
+          { text: '\u2713 DockPanel v2.8.0 installed in 47s', cls: 'text-emerald-400 font-medium', delay: 350 },
           { text: '  Panel \u2192 https://your-server:3080', cls: 'text-zinc-300', delay: 200 },
         ];
 

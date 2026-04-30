@@ -1,6 +1,6 @@
 # API Reference
 
-DockPanel exposes 733 REST endpoints (465 backend + 268 agent) across 50+ categories. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
+DockPanel exposes 760 REST endpoints (490 backend + 270 agent) across 50+ categories. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
 
 ## Authentication
 
@@ -670,6 +670,8 @@ Create a webhook integration.
 | DELETE | `/api/backup-orchestrator/vol-backups/{id}` | Delete volume backup |
 | GET | `/api/backup-orchestrator/verifications` | List verifications |
 | POST | `/api/backup-orchestrator/verify/{id}` | Verify a backup |
+| POST | `/api/backup-orchestrator/drill` | Trigger end-to-end drill (site/db/volume) — async, returns 202 |
+| GET | `/api/backup-orchestrator/drills` | List drills (paginated `{items, total}`) |
 
 ---
 
