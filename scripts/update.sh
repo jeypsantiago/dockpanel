@@ -289,6 +289,27 @@ for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dock
         NGINX_NEEDS_RELOAD=1
     fi
 done
+# Strip `ipv6only=on` from site vhosts left over from v2.8.3.
+# v2.8.3 baked the option into agent templates AND added it via update.sh;
+# v2.8.4 reverted the template but dropped this site-vhost cleanup. Result:
+# v2.8.3-installed sites kept `[::]:443 ssl ipv6only=on` while the panel vhost
+# (cleaned by the loop above) used plain `[::]:443 ssl` — nginx rejects the
+# mix as "duplicate listen options" on the shared socket. Bringing them back
+# in line restores reload-ability without touching site config in any other way.
+if [ -d /etc/nginx/sites-enabled ]; then
+    for site_conf in /etc/nginx/sites-enabled/*.conf; do
+        [ -f "$site_conf" ] || continue
+        case "$(basename "$site_conf")" in
+            dockpanel-panel.conf) continue ;;
+        esac
+        if grep -qE 'listen \[::\]:(80|443 ssl) ipv6only=on' "$site_conf"; then
+            sed -i -E 's|^([[:space:]]*)listen \[::\]:80 ipv6only=on;|\1listen [::]:80;|' "$site_conf"
+            sed -i -E 's|^([[:space:]]*)listen \[::\]:443 ssl ipv6only=on;|\1listen [::]:443 ssl;|' "$site_conf"
+            log "Stripped ipv6only=on from $site_conf for shared-socket compatibility"
+            NGINX_NEEDS_RELOAD=1
+        fi
+    done
+fi
 if [ "$NGINX_NEEDS_RELOAD" = "1" ]; then
     if nginx -t > /dev/null 2>&1; then
         nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen migration"

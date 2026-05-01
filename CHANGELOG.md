@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.5] - 2026-05-01
+
+### Fixed
+
+- **v2.8.4 upgrade path still hit `duplicate listen options for [::]:443`
+  on multi-site installs that ran v2.8.3 first
+  ([#48](https://github.com/ovexro/dockpanel/issues/48)).** v2.8.4
+  reverted the agent templates and panel vhost to plain
+  `listen [::]:80;` / `listen [::]:443 ssl;`, and v2.8.4's update.sh
+  stripped `ipv6only=on` from the panel vhost — but it dropped the
+  v2.8.3 site-vhost migration block, so any site provisioned on v2.8.3
+  kept `listen [::]:443 ssl ipv6only=on;` on disk. nginx accepts
+  panel-plain + ONE site-with-`ipv6only=on` on a shared `[::]:443`
+  socket, but rejects TWO-or-more site vhosts both setting
+  `ipv6only=on` with `duplicate listen options for [::]:443`. The
+  reload triggered by v2.8.4's update.sh therefore failed silently on
+  any install with 2+ sites — the new panel listen never took effect,
+  the IPv6 hijack from the original #48 persisted, and the next
+  `systemctl restart nginx` would refuse to start. update.sh now
+  strips `ipv6only=on` from every site vhost in
+  `/etc/nginx/sites-enabled/*.conf` (skipping the panel vhost, which is
+  already handled), bringing the listener options back in line so
+  nginx reloads cleanly. No code changes — fix is pure upgrade-script.
+  Manual one-liner for v2.8.4-stuck users:
+  ```
+  for f in /etc/nginx/sites-enabled/*.conf; do [ "$(basename "$f")" = dockpanel-panel.conf ] && continue; sed -i -E 's|^([[:space:]]*)listen \[::\]:(80\|443 ssl) ipv6only=on;|\1listen [::]:\2;|' "$f"; done && nginx -t && nginx -s reload
+  ```
+
 ## [2.8.4] - 2026-05-01
 
 ### Fixed
