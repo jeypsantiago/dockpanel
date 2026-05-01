@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.7] - 2026-05-01
+
+### Added
+
+- **Branding logo upload** ([#48](https://github.com/ovexro/exro/dockpanel/issues/48)
+  follow-up). Settings → Branding now exposes an "Upload image…" button
+  next to the existing Logo URL field. The frontend POSTs the file's
+  raw bytes to a new `POST /api/branding/logo` endpoint (admin-only,
+  PNG / JPEG / WebP, 2 MB cap, content-type *and* magic-bytes
+  validated to defend against MIME spoofing). Files are stored
+  content-addressed at `/var/lib/dockpanel/branding/logo-<hash>.<ext>`
+  and served back over `GET /api/branding/logo/{filename}` (public —
+  the login page is unauthenticated and needs to render the logo) with
+  `Cache-Control: public, max-age=31536000, immutable`. The upload
+  handler auto-saves `logo_url` so the new image takes effect on the
+  next page render. Surfaced when an `insxa` follow-up on issue #48
+  reported "branding image could not be saved" — the existing settings
+  field only accepted a URL, with no file upload UI. Admins on
+  air-gapped panels with no public CDN can now self-host their logo.
+
 ## [2.8.6] - 2026-05-01
 
 ### Fixed

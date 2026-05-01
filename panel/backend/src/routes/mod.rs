@@ -9,6 +9,7 @@ pub mod backup_destinations;
 pub mod backup_orchestrator;
 pub mod backup_schedules;
 pub mod backups;
+pub mod branding_assets;
 pub mod cdn;
 pub mod dashboard;
 pub mod oauth;
@@ -778,8 +779,11 @@ pub fn router() -> Router<AppState> {
         .route("/api/billing/plan", get(billing::current_plan))
         .route("/api/billing/checkout", post(billing::create_checkout))
         .route("/api/billing/portal", post(billing::customer_portal))
+        // Branding logo upload (admin)
+        .route("/api/branding/logo", post(branding_assets::upload_logo))
         // Public endpoints (no auth)
         .route("/api/branding", get(settings::branding))
+        .route("/api/branding/logo/{filename}", get(branding_assets::get_logo))
         .route("/api/auth/oauth/{provider}", get(oauth::authorize))
         .route("/api/auth/oauth/{provider}/callback", get(oauth::callback))
         .route("/api/status-page", get(monitors::status_page))

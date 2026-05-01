@@ -702,7 +702,40 @@ export default function Settings() {
             <div>
               <label className="block text-sm font-medium text-dark-100 mb-1">Logo URL</label>
               <input type="url" value={settings.logo_url || ""} onChange={e => setSettings({ ...settings, logo_url: e.target.value })}
-                placeholder="https://example.com/logo.png" className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 outline-none" />
+                placeholder="https://example.com/logo.png — or upload below" className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 outline-none" />
+              <div className="mt-2 flex items-center gap-3">
+                <label className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 border border-dark-500 rounded-lg text-xs font-medium cursor-pointer">
+                  Upload image…
+                  <input type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    if (file.size > 2 * 1024 * 1024) {
+                      setMessage({ text: "Image too large (max 2 MB)", type: "error" });
+                      return;
+                    }
+                    try {
+                      const buf = await file.arrayBuffer();
+                      const res = await fetch("/api/branding/logo", {
+                        method: "POST",
+                        credentials: "same-origin",
+                        headers: { "Content-Type": file.type, "X-Requested-With": "DockPanel" },
+                        body: buf,
+                      });
+                      const data = await res.json().catch(() => ({}));
+                      if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
+                      const newUrl = data.logo_url as string;
+                      setSettings({ ...settings, logo_url: newUrl });
+                      await api.put("/settings", { logo_url: newUrl });
+                      setMessage({ text: "Logo uploaded", type: "success" });
+                    } catch (err) {
+                      setMessage({ text: err instanceof Error ? err.message : "Upload failed", type: "error" });
+                    } finally {
+                      e.target.value = "";
+                    }
+                  }} />
+                </label>
+                <span className="text-xs text-dark-300">PNG, JPEG, or WebP — up to 2 MB</span>
+              </div>
             </div>
             <div>
               <label className="block text-sm font-medium text-dark-100 mb-1">Accent Color</label>
