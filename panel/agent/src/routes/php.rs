@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use crate::safe_cmd::safe_command;
+use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
 
 use super::AppState;
 
@@ -124,9 +124,10 @@ async fn install_version(
         .await;
 
     if ppa_check.is_err() {
-        // Try adding PPA
+        // Try adding PPA. Unsandboxed: writes to /etc/apt/sources.list.d
+        // and /usr via apt-get install software-properties-common.
         tracing::info!("Adding ondrej/php PPA...");
-        let ppa_result = safe_command("bash")
+        let ppa_result = safe_command_unsandboxed("bash", &[])
             .args(["-c", "apt-get update -qq && apt-get install -y -qq software-properties-common && add-apt-repository -y ppa:ondrej/php && apt-get update -qq"])
             .output()
             .await;
@@ -154,9 +155,9 @@ async fn install_version(
 
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("bash")
+        safe_command_unsandboxed("bash", &[])
             .args(["-c", &format!(
-                "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq {pkg_str} 2>&1"
+                "apt-get install -y -qq {pkg_str} 2>&1"
             )])
             .output(),
     )
@@ -280,9 +281,8 @@ async fn install_extension(Json(body): Json<serde_json::Value>) -> Result<Json<s
 
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        safe_command("apt-get")
+        safe_command_unsandboxed("apt-get", &[])
             .args(["install", "-y", &package])
-            .env("DEBIAN_FRONTEND", "noninteractive")
             .output()
     ).await
         .map_err(|_| php_api_err(StatusCode::GATEWAY_TIMEOUT, "Install timed out"))?
@@ -343,9 +343,9 @@ async fn uninstall_version(
     tracing::info!("Uninstalling PHP {version}...");
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("bash")
+        safe_command_unsandboxed("bash", &[])
             .args(["-c", &format!(
-                "DEBIAN_FRONTEND=noninteractive apt-get purge -y php{version}-* 2>&1"
+                "apt-get purge -y php{version}-* 2>&1"
             )])
             .output(),
     )
@@ -391,8 +391,8 @@ async fn uninstall_version(
     // 3. Autoremove
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("bash")
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>&1"])
+        safe_command_unsandboxed("bash", &[])
+            .args(["-c", "apt-get autoremove -y 2>&1"])
             .output(),
     )
     .await;

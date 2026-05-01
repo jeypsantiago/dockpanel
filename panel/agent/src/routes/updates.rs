@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_stream::StreamExt;
 use std::process::Stdio;
-use crate::safe_cmd::safe_command;
+use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
 
 use super::AppState;
 
@@ -73,12 +73,13 @@ fn parse_upgradable_line(line: &str) -> Option<PackageUpdate> {
 
 /// GET /system/updates — list available package updates.
 async fn list_updates() -> Json<Vec<PackageUpdate>> {
-    // Run apt update first (suppress output, 60s timeout)
+    // Run apt update first (suppress output, 60s timeout). Wrapped in
+    // systemd-run because `apt-get update` writes to /var/lib/apt/lists,
+    // which the agent's ProtectSystem=strict sandbox blocks.
     let _ = tokio::time::timeout(
         Duration::from_secs(60),
-        safe_command("apt-get")
+        safe_command_unsandboxed("apt-get", &[])
             .args(["update", "-qq"])
-            .env("DEBIAN_FRONTEND", "noninteractive")
             .output(),
     )
     .await;
@@ -146,8 +147,10 @@ async fn apply_updates(Json(body): Json<ApplyRequest>) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(128);
 
     tokio::spawn(async move {
-        let mut cmd = safe_command("apt-get");
-        cmd.env("DEBIAN_FRONTEND", "noninteractive");
+        // Wrapped in systemd-run: apt-get install/upgrade writes to
+        // /var/cache/apt, /var/lib/dpkg, and /usr, all blocked by the
+        // agent's ProtectSystem=strict sandbox.
+        let mut cmd = safe_command_unsandboxed("apt-get", &[]);
 
         if has_packages {
             let packages = body.packages.unwrap();

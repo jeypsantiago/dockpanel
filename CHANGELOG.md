@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.12] - 2026-05-01
+
+### Fixed
+
+- **Service Installers + System → Updates fail silently with `Read-only
+  file system` errors under the agent's `ProtectSystem=strict`
+  sandbox** ([#48](https://github.com/ovexro/dockpanel/issues/48)
+  followup). `dockpanel-agent.service` runs with `ProtectSystem=strict`
+  and a `ReadWritePaths=` list that omits `/var/cache/apt`,
+  `/var/lib/apt`, `/var/lib/dpkg`, and `/usr` — the paths apt and dpkg
+  must write to. Every install / upgrade path that spawned `apt-get`,
+  `snap install`, `dpkg`, or `curl | bash` from the agent inherited
+  the sandbox and EROFS'd the moment it tried to download a `.deb` or
+  install a binary into `/usr/bin`. Surfaced when `insxa` clicked
+  `Install` on Redis / Composer / Node.js / Cloudflare Tunnel / WAF
+  in Settings → Services — every one failed. System → Updates'
+  "Update All" button hit the same wall.
+  - Added `safe_command_unsandboxed()` (and a sync sibling) to
+    `panel/agent/src/safe_cmd.rs`. The helper invokes the binary via
+    `systemd-run --quiet --pipe --wait --collect --setenv=... -- <bin>`,
+    which routes through PID1 to spawn a transient unit in PID1's
+    own mount namespace. The inner binary sees the full filesystem
+    read-write while the agent itself stays sandboxed for everything
+    else. Every `--setenv` flag explicitly re-establishes the
+    sanitized env (`PATH`/`HOME`/`LANG`/`LC_ALL`/`DEBIAN_FRONTEND`)
+    so the inner binary doesn't inherit PID1's wider environment.
+  - Converted ~25 call sites that legitimately need `/usr` write
+    access to use the new helper:
+    `panel/agent/src/routes/updates.rs` (`apt-get update` and
+    `apt-get install/upgrade`), `service_installer.rs` (every
+    `install_*` and `uninstall_*` shell script + the
+    `rm /usr/local/bin/composer` in `uninstall_composer`),
+    `php.rs` (`add-apt-repository ppa:ondrej/php`, `apt-get install`
+    for PHP base + extensions, `apt-get purge`/`autoremove`),
+    `server_utils.rs` (`enable_auto_updates`'s `apt-get install
+    unattended-upgrades`), and `services/smtp.rs` (`ensure_msmtp`'s
+    `apt-get install msmtp`).
+  - Read-only callers (`apt list --upgradable`, `apt-cache show`,
+    `dpkg -l`, `which <bin>`) keep using the sandboxed `safe_command`
+    — `ProtectSystem=strict` permits reads of `/var/lib/apt/lists`
+    and `/var/lib/dpkg`, so wrapping them with `systemd-run` would
+    just add overhead.
+  - Empirically verified: from inside the agent's mount namespace,
+    `touch /var/cache/apt/archives/_test` returns `EROFS`; the same
+    `touch` wrapped in `systemd-run --quiet --pipe --wait --collect --`
+    succeeds because the transient unit gets a fresh mount namespace.
+    Smoke-tested on demo: `GET /system/updates` returned 69
+    upgradable packages cleanly (was returning empty pre-fix because
+    `apt-get update` EROFS'd before populating the lists).
+
+  WAF + Cloudflare Tunnel installers will partially succeed in
+  v2.8.12 (apt step now works) but still hit `EROFS` on follow-up
+  `std::fs::write` / `create_dir_all` calls into `/etc/modsecurity`
+  and `/etc/cloudflared`. v2.8.13 will close those by either adding
+  the directories to the unit's `ReadWritePaths` or by routing
+  those writes through the same helper.
+
 ## [2.8.11] - 2026-05-01
 
 ### Fixed

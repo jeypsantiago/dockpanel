@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
 };
 use std::time::Duration;
-use crate::safe_cmd::safe_command;
+use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
 
 use super::AppState;
 
@@ -105,7 +105,7 @@ async fn install_php() -> Result<Json<serde_json::Value>, ApiErr> {
 
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", &format!("DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y {packages}")])
             .output()
     ).await
@@ -133,7 +133,7 @@ async fn install_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
     // Remove old apt-based certbot first (if present) to avoid conflicts
     let _ = tokio::time::timeout(
         Duration::from_secs(120),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "systemctl stop certbot.timer 2>/dev/null; systemctl disable certbot.timer 2>/dev/null; DEBIAN_FRONTEND=noninteractive apt-get purge -y certbot python3-certbot-nginx 2>/dev/null; true"])
             .output()
     ).await;
@@ -142,7 +142,7 @@ async fn install_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
     // Fallback: pip (works when snap is unavailable)
     let snap_ok = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "snap install --classic certbot && ln -sf /snap/bin/certbot /usr/bin/certbot"])
             .output()
     ).await
@@ -155,7 +155,7 @@ async fn install_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
     if snap_ok {
         let _ = tokio::time::timeout(
             Duration::from_secs(120),
-            safe_command("sh")
+            safe_command_unsandboxed("sh", &[])
                 .args(["-c", "snap set certbot trust-plugin-with-root=ok && snap install certbot-nginx"])
                 .output()
         ).await;
@@ -176,7 +176,7 @@ async fn install_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
     // Fallback: pip install (gets latest certbot from PyPI)
     let pip_ok = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv && \
                 python3 -m venv /opt/certbot && \
                 /opt/certbot/bin/pip install --upgrade pip && \
@@ -212,7 +212,7 @@ async fn install_ufw() -> Result<Json<serde_json::Value>, ApiErr> {
 
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y ufw"])
             .output()
     ).await
@@ -249,7 +249,7 @@ async fn install_fail2ban() -> Result<Json<serde_json::Value>, ApiErr> {
 
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y fail2ban"])
             .output()
     ).await
@@ -300,7 +300,7 @@ async fn install_powerdns() -> Result<Json<serde_json::Value>, ApiErr> {
     // 1. Install packages
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y pdns-server pdns-backend-pgsql"])
             .output()
     ).await
@@ -338,7 +338,7 @@ async fn install_powerdns() -> Result<Json<serde_json::Value>, ApiErr> {
             // Use shell pipe to feed schema to psql
             let _ = tokio::time::timeout(
                 Duration::from_secs(120),
-                safe_command("sh")
+                safe_command_unsandboxed("sh", &[])
                     .args(["-c", &format!("cat {} | docker exec -i dockpanel-postgres psql -U dockpanel -d pdns", schema_path)])
                     .output()
             ).await;
@@ -413,7 +413,7 @@ async fn install_redis() -> Result<Json<serde_json::Value>, ApiErr> {
 
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y redis-server"])
             .output()
     ).await
@@ -451,7 +451,7 @@ async fn install_nodejs() -> Result<Json<serde_json::Value>, ApiErr> {
 
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y nodejs"])
             .output()
     ).await
@@ -484,7 +484,7 @@ async fn install_composer() -> Result<Json<serde_json::Value>, ApiErr> {
 
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer"])
             .output()
     ).await
@@ -524,7 +524,7 @@ async fn uninstall_php() -> Result<Json<serde_json::Value>, ApiErr> {
     // Purge all PHP packages for this version
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", &format!("DEBIAN_FRONTEND=noninteractive apt-get purge -y php{version}-* && apt-get autoremove -y")])
             .output()
     ).await
@@ -554,7 +554,7 @@ async fn uninstall_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
     // Remove snap certbot (if installed)
     let _ = tokio::time::timeout(
         Duration::from_secs(120),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "snap remove certbot 2>/dev/null; snap remove certbot-nginx 2>/dev/null; true"])
             .output()
     ).await;
@@ -570,7 +570,7 @@ async fn uninstall_certbot() -> Result<Json<serde_json::Value>, ApiErr> {
     // Remove apt certbot (if installed)
     let _ = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y certbot python3-certbot-nginx 2>/dev/null; apt-get autoremove -y 2>/dev/null; true"])
             .output()
     ).await;
@@ -593,7 +593,7 @@ async fn uninstall_ufw() -> Result<Json<serde_json::Value>, ApiErr> {
     // Purge UFW
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y ufw && apt-get autoremove -y"])
             .output()
     ).await
@@ -621,7 +621,7 @@ async fn uninstall_fail2ban() -> Result<Json<serde_json::Value>, ApiErr> {
     // Purge fail2ban
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y fail2ban && apt-get autoremove -y"])
             .output()
     ).await
@@ -652,7 +652,7 @@ async fn uninstall_powerdns() -> Result<Json<serde_json::Value>, ApiErr> {
     // Purge PowerDNS packages
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y pdns-server pdns-backend-pgsql && apt-get autoremove -y"])
             .output()
     ).await
@@ -683,7 +683,7 @@ async fn uninstall_redis() -> Result<Json<serde_json::Value>, ApiErr> {
     // Purge redis
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y redis-server && apt-get autoremove -y"])
             .output()
     ).await
@@ -707,7 +707,7 @@ async fn uninstall_nodejs() -> Result<Json<serde_json::Value>, ApiErr> {
     // Purge nodejs
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y nodejs && apt-get autoremove -y"])
             .output()
     ).await
@@ -731,10 +731,12 @@ async fn uninstall_nodejs() -> Result<Json<serde_json::Value>, ApiErr> {
 async fn uninstall_composer() -> Result<Json<serde_json::Value>, ApiErr> {
     tracing::info!("Uninstalling Composer...");
 
-    // Composer is just a binary — remove it
+    // Composer is just a binary — remove it. Wrapped in systemd-run because
+    // /usr/local/bin is under /usr, which the agent's ProtectSystem=strict
+    // sandbox makes read-only.
     let output = tokio::time::timeout(
         Duration::from_secs(120),
-        safe_command("rm").args(["-f", "/usr/local/bin/composer"]).output()
+        safe_command_unsandboxed("rm", &[]).args(["-f", "/usr/local/bin/composer"]).output()
     ).await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Composer uninstall timed out"))?
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Composer uninstall failed: {e}")))?;
@@ -814,7 +816,7 @@ async fn install_waf() -> Result<Json<serde_json::Value>, ApiErr> {
     // 1. Install libmodsecurity3 and nginx connector
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get update && \
                 DEBIAN_FRONTEND=noninteractive apt-get install -y libmodsecurity3 libnginx-mod-http-modsecurity"])
             .output()
@@ -840,7 +842,7 @@ async fn install_waf() -> Result<Json<serde_json::Value>, ApiErr> {
     if !std::path::Path::new(&format!("{crs_dir}/crs-setup.conf")).exists() {
         let dl = tokio::time::timeout(
             Duration::from_secs(120),
-            safe_command("sh")
+            safe_command_unsandboxed("sh", &[])
                 .args(["-c", &format!(
                     "cd /tmp && \
                      curl -sL https://github.com/coreruleset/coreruleset/archive/refs/tags/v4.25.0.tar.gz -o crs.tar.gz && \
@@ -945,7 +947,7 @@ async fn uninstall_waf() -> Result<Json<serde_json::Value>, ApiErr> {
     // Purge packages
     let output = tokio::time::timeout(
         Duration::from_secs(300),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y libnginx-mod-http-modsecurity libmodsecurity3 && apt-get autoremove -y"])
             .output()
     ).await
@@ -972,7 +974,7 @@ async fn install_cloudflared() -> Result<Json<serde_json::Value>, ApiErr> {
 
     let output = tokio::time::timeout(
         Duration::from_secs(120),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "curl -sL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg && \
                 echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main' > /etc/apt/sources.list.d/cloudflared.list && \
                 DEBIAN_FRONTEND=noninteractive apt-get update && \
@@ -1011,7 +1013,7 @@ async fn uninstall_cloudflared() -> Result<Json<serde_json::Value>, ApiErr> {
 
     let output = tokio::time::timeout(
         Duration::from_secs(120),
-        safe_command("sh")
+        safe_command_unsandboxed("sh", &[])
             .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y cloudflared && apt-get autoremove -y"])
             .output()
     ).await

@@ -1,4 +1,4 @@
-use crate::safe_cmd::{safe_command, safe_command_sync};
+use crate::safe_cmd::{safe_command, safe_command_sync, safe_command_sync_unsandboxed};
 
 const MSMTP_CONFIG: &str = "/etc/msmtprc";
 
@@ -11,9 +11,8 @@ fn ensure_msmtp() -> Result<(), String> {
 
     if !status.status.success() {
         tracing::info!("Installing msmtp...");
-        let install = safe_command_sync("apt-get")
+        let install = safe_command_sync_unsandboxed("apt-get", &[])
             .args(["install", "-y", "msmtp", "msmtp-mta"])
-            .env("DEBIAN_FRONTEND", "noninteractive")
             .output()
             .map_err(|e| format!("Failed to install msmtp: {e}"))?;
 

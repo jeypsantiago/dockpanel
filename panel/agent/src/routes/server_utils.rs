@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use crate::safe_cmd::safe_command;
+use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
 
 use super::AppState;
 use base64::Engine as _;
@@ -282,9 +282,10 @@ async fn auto_updates_status() -> Result<Json<serde_json::Value>, ApiErr> {
 }
 
 async fn enable_auto_updates() -> Result<Json<serde_json::Value>, ApiErr> {
-    // Install unattended-upgrades if not present
-    let _ = safe_command("sh")
-        .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades"])
+    // Install unattended-upgrades if not present. Unsandboxed: apt-get install
+    // writes to /var/lib/dpkg + /usr.
+    let _ = safe_command_unsandboxed("sh", &[])
+        .args(["-c", "apt-get install -y unattended-upgrades"])
         .output()
         .await;
 
