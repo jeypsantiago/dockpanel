@@ -115,7 +115,7 @@ pub async fn provision(
         agent_body["proxy_port"] = serde_json::json!(port);
     }
     if let Some(ref php) = site.php_version {
-        agent_body["php_socket"] = serde_json::json!(format!("/run/php/php{php}-fpm.sock"));
+        agent_body["php_socket"] = serde_json::json!(format!("unix:/run/php/php{php}-fpm.sock"));
     }
     if let Some(ref root) = site.root_path {
         agent_body["root"] = serde_json::json!(root);
@@ -401,7 +401,7 @@ pub async fn renew(
         agent_body["proxy_port"] = serde_json::json!(port);
     }
     if let Some(ref php) = site.php_version {
-        agent_body["php_socket"] = serde_json::json!(format!("/run/php/php{php}-fpm.sock"));
+        agent_body["php_socket"] = serde_json::json!(format!("unix:/run/php/php{php}-fpm.sock"));
     }
     if let Some(ref root) = site.root_path {
         agent_body["root"] = serde_json::json!(root);

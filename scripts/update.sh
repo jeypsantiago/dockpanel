@@ -255,6 +255,51 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
     done
 fi
 
+# ── Migrate panel nginx config to bind IPv6 (fixes site-vhost dual-stack hijack) ──
+# v2.8.3: agent site templates dual-stack `[::]:443 ssl` overshadow the panel for
+# IPv6 clients when the panel itself only binds IPv4. Pair every IPv4 listen with
+# an `ipv6only=on` IPv6 listen so each vhost owns its own protocol space.
+NGINX_NEEDS_RELOAD=0
+for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
+    [ -f "$conf" ] || continue
+    if ! grep -qE 'listen \[::\]:80' "$conf"; then
+        sed -i -E '0,/^([[:space:]]*)listen ([^;]*):80;[[:space:]]*$/{s//\1listen \2:80;\n\1listen [::]:80 ipv6only=on;/}' "$conf"
+        sed -i -E '0,/^([[:space:]]*)listen 80;[[:space:]]*$/{s//\1listen 80;\n\1listen [::]:80 ipv6only=on;/}' "$conf"
+        log "Added IPv6 :80 listen to $conf"
+        NGINX_NEEDS_RELOAD=1
+    fi
+    if grep -qE 'listen [^;]*:443 ssl' "$conf" && ! grep -qE 'listen \[::\]:443' "$conf"; then
+        sed -i -E '0,/^([[:space:]]*)listen ([^;]*):443 ssl;[[:space:]]*$/{s//\1listen \2:443 ssl;\n\1listen [::]:443 ssl ipv6only=on;/}' "$conf"
+        log "Added IPv6 :443 ssl listen to $conf"
+        NGINX_NEEDS_RELOAD=1
+    fi
+done
+# Migrate every site vhost too: add `ipv6only=on` to any plain `[::]:80` /
+# `[::]:443 ssl` listen so dual-stack sockets stop overshadowing the panel
+# (and stop overshadowing each other on multi-site installs). Leaves listens
+# that already specify ipv6only / ipv6only=off untouched.
+if [ -d /etc/nginx/sites-enabled ]; then
+    for site_conf in /etc/nginx/sites-enabled/*.conf; do
+        [ -f "$site_conf" ] || continue
+        # Skip already-migrated lines: only match listens that have no further
+        # parameters between `[::]:PORT[ ssl]` and the trailing `;`.
+        if grep -qE '^[[:space:]]*listen \[::\]:80;[[:space:]]*$' "$site_conf" \
+        || grep -qE '^[[:space:]]*listen \[::\]:443 ssl;[[:space:]]*$' "$site_conf"; then
+            sed -i -E 's|^([[:space:]]*)listen \[::\]:80;[[:space:]]*$|\1listen [::]:80 ipv6only=on;|' "$site_conf"
+            sed -i -E 's|^([[:space:]]*)listen \[::\]:443 ssl;[[:space:]]*$|\1listen [::]:443 ssl ipv6only=on;|' "$site_conf"
+            log "Migrated IPv6 listen ipv6only=on in $site_conf"
+            NGINX_NEEDS_RELOAD=1
+        fi
+    done
+fi
+if [ "$NGINX_NEEDS_RELOAD" = "1" ]; then
+    if nginx -t > /dev/null 2>&1; then
+        nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen migration"
+    else
+        log "WARN: nginx -t failed after IPv6 listen migration; not reloading. Check sites-enabled/."
+    fi
+fi
+
 # Ensure BASE_URL is set in api.env for CORS
 if [ -f /etc/dockpanel/api.env ] && ! grep -q "BASE_URL" /etc/dockpanel/api.env; then
     # Detect panel URL from nginx config

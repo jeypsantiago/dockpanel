@@ -595,7 +595,7 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
             agent_body["proxy_port"] = serde_json::json!(port);
         }
         if let Some(php) = php_version {
-            agent_body["php_socket"] = serde_json::json!(format!("/run/php/php{php}-fpm.sock"));
+            agent_body["php_socket"] = serde_json::json!(format!("unix:/run/php/php{php}-fpm.sock"));
         }
         if let Some(root) = root_path {
             agent_body["root"] = serde_json::json!(root);

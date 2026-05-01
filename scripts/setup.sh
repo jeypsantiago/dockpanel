@@ -720,13 +720,17 @@ configure_nginx() {
     local LISTEN_DIRECTIVE="listen ${PANEL_PORT};"
     if [ -n "$PANEL_DOMAIN" ]; then
         SERVER_NAME="$PANEL_DOMAIN"
-        # Use interface IP to match agent-generated site configs (prevents nginx routing conflicts)
+        # Use interface IP to match agent-generated site configs (prevents nginx routing conflicts).
+        # Always pair the IPv4 listen with an IPv6 listen so that agent-managed site vhosts
+        # (which bind [::]:443 ssl) don't dual-stack-overshadow the panel for IPv6 clients.
         local BIND_IP
         BIND_IP=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
         if [ -n "$BIND_IP" ]; then
-            LISTEN_DIRECTIVE="listen ${BIND_IP}:80;"
+            LISTEN_DIRECTIVE="listen ${BIND_IP}:80;
+    listen [::]:80 ipv6only=on;"
         else
-            LISTEN_DIRECTIVE="listen 80;"
+            LISTEN_DIRECTIVE="listen 80;
+    listen [::]:80 ipv6only=on;"
         fi
     fi
 

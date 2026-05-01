@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.3] - 2026-05-01
+
+### Fixed
+
+- **Manual "Let's Encrypt SSL" provisioning failed with `Template
+  render error: Invalid PHP socket path` on PHP sites
+  ([#48](https://github.com/ovexro/dockpanel/issues/48)).** Four backend
+  call sites built the agent's `php_socket` field as
+  `/run/php/phpX-fpm.sock`, but the agent's strict validator
+  (`is_safe_php_socket`, `panel/agent/src/services/nginx.rs:149`)
+  requires the `unix:/...` prefix and 500'd the request. The auto-SSL
+  background task at site-creation time was correct (`sites.rs:557`),
+  which is why `Auto-SSL attempt 2` succeeded after the manual click
+  500'd in between. Fixed in `routes/ssl.rs:118,404`,
+  `services/auto_healer.rs:598`, and `services/security_scanner.rs:271`
+  — all now emit `unix:/run/php/phpX-fpm.sock` like the working
+  site-creation path.
+
+- **Visiting the panel URL redirected to a freshly-installed WordPress
+  site after that site's Let's Encrypt SSL was provisioned
+  ([#48](https://github.com/ovexro/dockpanel/issues/48)).** Root cause
+  was a dual-stack listen mismatch: agent-rendered site nginx vhosts
+  declared `listen [::]:443 ssl;` (no `ipv6only=on`), but
+  `scripts/setup.sh` bound the panel's vhost to IPv4 only. The first
+  site to provision SSL therefore became the de-facto default for any
+  IPv6 (or non-matched-IPv4) request — WordPress saw a Host that didn't
+  match `home_url` and 301'd to its canonical domain. Fixed by adding
+  `ipv6only=on` to all `[::]:80` and `[::]:443 ssl` listens across
+  `panel/agent/src/templates/nginx/{http,https,proxy}.conf`, pairing
+  every panel IPv4 listen in `setup.sh` with an `ipv6only=on` IPv6
+  listen, and adding a one-shot migration in `scripts/update.sh` so
+  existing installs gain the IPv6 listen on next upgrade.
+
 ## [2.8.2] - 2026-04-30
 
 ### Added
