@@ -715,8 +715,11 @@ pub async fn apply_fix(fix_id: &str) -> Result<String, String> {
             if target.is_empty() {
                 return Err("No service specified".into());
             }
-            // Validate service name
-            if !target.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            // Validate service name. systemd unit names can legitimately contain
+            // dots (php8.3-fpm, containerd.service, etc.) — the previous validator
+            // rejected dots and silently broke every PHP-FPM restart on hosts
+            // where the unit is named with a version (Debian / Ubuntu default).
+            if !target.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
                 return Err("Invalid service name".into());
             }
             let output = tokio::time::timeout(

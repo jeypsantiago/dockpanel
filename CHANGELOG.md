@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.9] - 2026-05-01
+
+### Fixed
+
+- **Agent's `restart-service` validator rejected systemd unit names
+  containing a dot.** `php8.3-fpm`, `containerd.service`, etc. are
+  legitimate unit names but the regex was `[a-z0-9_-]+` only. Surfaced
+  in the same `insxa` followup on issue #48 — every PHP-FPM auto-heal
+  attempt was returning "Invalid service name" silently. Also affected
+  the post-restore PHP-FPM reload in `routes/backups.rs:244`. Fix:
+  allow `.` in service names. Dots in systemd unit names cannot be
+  used for path traversal because `systemctl restart <name>` doesn't
+  treat the argument as a path.
+
+- **Seven Settings toggles silently rejected by the backend whitelist**
+  ([#48](https://github.com/ovexro/dockpanel/issues/48) followup).
+  `PUT /api/settings` validates incoming keys against a hard-coded
+  allow-list. Several security/registration toggles in the Settings UI
+  wrote keys that were absent from that list — `self_registration_enabled`,
+  `security_approval_required`, `security_geo_alert_enabled`,
+  `security_session_recording`, `security_db_backup_enabled`,
+  `security_canary_enabled`, `security_lockdown_threshold`. Toggling
+  them returned `400 Unknown setting: <key>`, the toast surfaced as
+  "Failed", and the value never persisted. Backend code paths
+  (`routes/auth.rs`, `services/security_hardening.rs`) already *read*
+  these keys, so the runtime behaviour was tied to whatever value was
+  set out-of-band. Surfaced when an `insxa` followup on issue #48
+  reported "these two in settings are not opted: Self-Registration,
+  Require Approval for New Users" — same root cause as v2.8.5's
+  ipv6only-strip migration miss: a list that grew implicit coupling
+  to other parts of the codebase that nobody updated when new toggles
+  were added. Frontend-only would have masked the issue with try/catch;
+  the right fix is at the writer-side gate. No agent / cli / frontend
+  code changes; binaries recompiled to carry the v2.8.9 version
+  string.
+
 ## [2.8.8] - 2026-05-01
 
 ### Fixed

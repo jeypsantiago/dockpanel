@@ -72,6 +72,12 @@ pub async fn update(
         "notif_template_discord", "notif_template_webhook",
         // Telemetry
         "telemetry_enabled", "telemetry_endpoint",
+        // Registration + approval gates (read by routes/auth.rs)
+        "self_registration_enabled", "security_approval_required",
+        // Security toggles (read by services/security_hardening.rs)
+        "security_geo_alert_enabled", "security_session_recording",
+        "security_db_backup_enabled", "security_canary_enabled",
+        "security_lockdown_threshold",
     ];
     for key in body.keys() {
         if !allowed_keys.contains(&key.as_str()) {
