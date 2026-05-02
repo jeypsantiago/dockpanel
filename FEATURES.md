@@ -1,6 +1,6 @@
 # DockPanel Feature Manifest
 
-> **Last verified**: 2026-05-01 | **Version**: v2.8.12 | **Total**: 60+ major features, ~285 capabilities
+> **Last verified**: 2026-05-02 | **Version**: v2.8.13 | **Total**: 60+ major features, ~285 capabilities
 >
 > This file is the single source of truth for what DockPanel offers.
 > Update it whenever features are added, changed, or removed.
