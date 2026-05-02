@@ -198,42 +198,21 @@ log "Ensuring required directories exist..."
 mkdir -p /etc/dockpanel/ssl /var/run/dockpanel /var/backups/dockpanel
 mkdir -p /var/www/acme/.well-known/acme-challenge
 mkdir -p /var/lib/dockpanel/git
-# Directories needed by agent ReadWritePaths (created only if missing)
-for d in /etc/postfix /etc/dovecot /var/vmail /var/spool/postfix /run/opendkim /var/lib/nginx; do
+# Directories needed by agent ReadWritePaths (created only if missing).
+# v2.8.13 expanded the RWP list — systemd fails the namespace mount on
+# missing entries, so pre-create everything the canonical unit references.
+for d in /etc/postfix /etc/dovecot /var/vmail /var/spool/postfix /run/opendkim /var/lib/nginx \
+         /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns /etc/letsencrypt; do
     [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || true
 done
 echo "d /run/dockpanel 0755 root root -" > /etc/tmpfiles.d/dockpanel.conf 2>/dev/null || true
 
 # ── Refresh systemd service files (may have changed between versions) ─────
 log "Updating systemd service files..."
-cat > /etc/systemd/system/dockpanel-agent.service << 'EOF'
-[Unit]
-Description=DockPanel Agent
-After=network.target nginx.service
-Wants=nginx.service
-StartLimitBurst=5
-StartLimitIntervalSec=60
-
-[Service]
-Type=simple
-ExecStartPre=/bin/sh -c 'mkdir -p /run/dockpanel /var/lib/dockpanel/git'
-ExecStart=/usr/local/bin/dockpanel-agent
-ExecStartPost=/bin/sh -c 'sleep 1 && chgrp $(getent group www-data >/dev/null 2>&1 && echo www-data || echo nginx) /var/run/dockpanel/agent.sock 2>/dev/null; chmod 660 /var/run/dockpanel/agent.sock 2>/dev/null; true'
-Restart=always
-RestartSec=5
-Environment=RUST_LOG=info
-NoNewPrivileges=no
-ProtectSystem=no
-ProtectHome=no
-PrivateTmp=no
-ProtectKernelLogs=yes
-ProtectKernelModules=yes
-MemoryMax=512M
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
+# Agent unit — deploy from repo (single source of truth: panel/agent/dockpanel-agent.service)
+# v2.8.13: existing installs upgrading from v2.8.12 or earlier get the strict sandbox here.
+cp "$AGENT_SRC/dockpanel-agent.service" /etc/systemd/system/dockpanel-agent.service
+chmod 644 /etc/systemd/system/dockpanel-agent.service
 
 cat > /etc/systemd/system/dockpanel-api.service << 'EOF'
 [Unit]

@@ -6,6 +6,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.13] - 2026-05-02
+
+### Changed
+
+- **`dockpanel-agent.service` is now deployed from a single source of
+  truth** ([#48](https://github.com/ovexro/dockpanel/issues/48)
+  followup). The in-repo unit file at
+  `panel/agent/dockpanel-agent.service` was historically a hardened
+  reference (`ProtectSystem=strict` + a curated `ReadWritePaths=` list)
+  that no installer ever deployed — `scripts/setup.sh` and
+  `scripts/update.sh` both wrote a permissive
+  `ProtectSystem=no`/`ProtectHome=no`/`PrivateTmp=no` unit inline via
+  heredoc, so every install.sh-based install ran with no namespace
+  hardening at all. v2.8.13 deletes both heredocs and has the install
+  scripts `cp` the canonical unit file from the repo. Existing installs
+  upgrading via `update.sh` get the strict sandbox automatically on the
+  next update; the daemon-reload + agent restart that update.sh already
+  performs at the end of its run picks up the new unit. The remote-agent
+  installer (`scripts/install-agent.sh`) is intentionally left on its
+  own inline heredoc — it deploys a different unit (after
+  `docker.service`, no nginx dep, env-file driven) for the multi-host
+  remote-agent path.
+
+### Security
+
+- **Hardened the deployed agent sandbox to `ProtectSystem=strict` plus
+  the full `Protect*` / `Restrict*` set** ([#48](https://github.com/ovexro/dockpanel/issues/48)
+  followup). The new `ReadWritePaths=` covers everything the agent
+  actually writes via `std::fs::write` / `tokio::fs::write` /
+  `create_dir_all`: the original eight (`/etc/nginx /etc/dockpanel
+  /var/run/dockpanel /var/backups/dockpanel /var/lib/dockpanel /var/www
+  /var/log /etc/letsencrypt`) plus ten new paths grepped from current
+  agent code (`/etc/apt /etc/fail2ban /etc/systemd/system /etc/powerdns
+  /etc/modsecurity /etc/cloudflared /etc/postfix /etc/dovecot
+  /var/spool/postfix /opt`). v2.8.12's `safe_command_unsandboxed`
+  systemd-run wrapper continues to handle the apt/dpkg/snap subprocess
+  paths that can't be expressed via `ReadWritePaths=`. Net effect: the
+  agent now runs with meaningful kernel-namespace isolation —
+  `ProtectKernel{Logs,Modules,Tunables}=yes`,
+  `ProtectControlGroups=yes`, `ProtectClock=yes`,
+  `ProtectHostname=yes`, `RestrictRealtime=yes`,
+  `RestrictSUIDSGID=yes`, `LockPersonality=yes`,
+  `RestrictNamespaces=~user`, `NoNewPrivileges=yes`, `ProtectHome=yes`,
+  `PrivateTmp=yes`. None of this hardening was ever active on
+  install.sh-installed users; demo had a hand-deployed strict version
+  which is what surfaced the v2.8.12 EROFS bug.
+
+### Known limitations
+
+- The mail subsystem (`panel/agent/src/routes/mail.rs:173-174`) still
+  spawns `useradd`/`groupadd` via the sandboxed `safe_command`, which
+  fails under `ProtectSystem=strict` because `/etc/passwd`,
+  `/etc/shadow`, and `/etc/group` are too sensitive to add to
+  `ReadWritePaths=`. This was already broken under demo's strict
+  sandbox; mail provisioning has been silently failing on that path.
+  v2.8.14 will wrap the user/group creation calls with the
+  v2.8.12 `safe_command_unsandboxed` pattern (systemd-run escape) for
+  a clean fix.
+
 ## [2.8.12] - 2026-05-01
 
 ### Fixed

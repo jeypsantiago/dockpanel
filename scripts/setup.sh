@@ -342,10 +342,13 @@ create_directories() {
     echo "d /run/dockpanel 0755 root root -" > /etc/tmpfiles.d/dockpanel.conf
 
     # Create all directories/files required by systemd ReadWritePaths
-    # (these may not exist yet on a fresh install — services are installed later)
+    # (these may not exist yet on a fresh install — services are installed later).
+    # systemd evaluates ReadWritePaths at unit start; missing dirs would fail
+    # the namespace mount, so pre-create everything the canonical agent unit lists.
     mkdir -p /etc/postfix /etc/dovecot /var/vmail /var/spool/postfix /run/opendkim
     mkdir -p /var/lib/nginx /etc/letsencrypt /var/lib/dpkg /var/cache/apt /var/lib/apt
     mkdir -p /etc/php /var/spool/cron /var/lib/dockpanel/git /var/lib/dockpanel/recordings
+    mkdir -p /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns
     touch /etc/opendkim.conf /run/nginx.pid 2>/dev/null || true
 
     log "Directories created"
@@ -580,35 +583,9 @@ build_frontend() {
 create_services() {
     header "Systemd Services"
 
-    # Agent service
-    cat > /etc/systemd/system/dockpanel-agent.service << 'EOF'
-[Unit]
-Description=DockPanel Agent
-After=network.target nginx.service
-Wants=nginx.service
-StartLimitBurst=5
-StartLimitIntervalSec=60
-
-[Service]
-Type=simple
-ExecStartPre=/bin/sh -c 'mkdir -p /run/dockpanel /var/lib/dockpanel/git'
-ExecStart=/usr/local/bin/dockpanel-agent
-ExecStartPost=/bin/sh -c 'sleep 1 && chgrp $(getent group www-data >/dev/null 2>&1 && echo www-data || echo nginx) /var/run/dockpanel/agent.sock 2>/dev/null; chmod 660 /var/run/dockpanel/agent.sock 2>/dev/null; true'
-Restart=always
-RestartSec=5
-Environment=RUST_LOG=info
-NoNewPrivileges=no
-ProtectSystem=no
-ProtectHome=no
-PrivateTmp=no
-ProtectKernelLogs=yes
-ProtectKernelModules=yes
-MemoryMax=512M
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    # Agent service — deploy from repo (single source of truth: panel/agent/dockpanel-agent.service)
+    cp "$AGENT_SRC/dockpanel-agent.service" /etc/systemd/system/dockpanel-agent.service
+    chmod 644 /etc/systemd/system/dockpanel-agent.service
 
     # API service
     cat > /etc/systemd/system/dockpanel-api.service << 'EOF'
