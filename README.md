@@ -27,7 +27,7 @@
 ## Install
 
 ```bash
-curl -sL https://dockpanel.dev/install.sh | sudo bash
+curl -sL https://dockpanel.sntgz.xyz/install.sh | sudo bash
 ```
 
 Open `http://YOUR_SERVER_IP:8443`, create your admin account, done.
