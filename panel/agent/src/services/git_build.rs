@@ -639,18 +639,34 @@ fn detect_project_port(context_dir: &std::path::Path) -> Option<u16> {
 }
 
 pub fn suggest_container_port(name: &str, dockerfile_path: &str, build_context: &str) -> Result<u16, String> {
-    let deploy_dir = format!("{GIT_BASE_DIR}/{name}");
-    let context_dir = if build_context == "." { deploy_dir.clone() } else { format!("{deploy_dir}/{build_context}") };
-    let context_dir = std::path::Path::new(&context_dir);
+    suggest_container_port_in(std::path::Path::new(GIT_BASE_DIR), name, dockerfile_path, build_context)
+}
+
+fn suggest_container_port_in(
+    base_dir: &std::path::Path,
+    name: &str,
+    dockerfile_path: &str,
+    build_context: &str,
+) -> Result<u16, String> {
+    let deploy_dir = base_dir.join(name);
+    let context_dir = if build_context == "." {
+        deploy_dir
+    } else {
+        deploy_dir.join(build_context)
+    };
     let df_path = context_dir.join(dockerfile_path);
 
     if df_path.exists() {
         let contents = std::fs::read_to_string(&df_path)
             .map_err(|e| format!("Failed to read Dockerfile: {e}"))?;
-        return Ok(parse_dockerfile_exposed_port(&contents).or_else(|| detect_project_port(context_dir)).unwrap_or(3000));
+        return Ok(
+            parse_dockerfile_exposed_port(&contents)
+                .or_else(|| detect_project_port(&context_dir))
+                .unwrap_or(3000),
+        );
     }
 
-    Ok(detect_project_port(context_dir).unwrap_or(3000))
+    Ok(detect_project_port(&context_dir).unwrap_or(3000))
 }
 
 /// Auto-detect language and generate a Dockerfile if none exists.
@@ -1370,8 +1386,8 @@ mod tests {
         format!("{prefix}-{nanos}")
     }
 
-    fn prepare_repo(name: &str) -> std::path::PathBuf {
-        let repo_dir = std::path::Path::new(GIT_BASE_DIR).join(name);
+    fn prepare_repo(base_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let repo_dir = base_dir.join(name);
         fs::create_dir_all(&repo_dir).expect("create temp repo");
         repo_dir
     }
@@ -1385,28 +1401,30 @@ mod tests {
     #[test]
     fn suggests_static_frontend_port_80() {
         let name = unique_name("static-port");
-        let repo_dir = prepare_repo(&name);
+        let base_dir = std::env::temp_dir().join(unique_name("dockpanel-git-base"));
+        let repo_dir = prepare_repo(&base_dir, &name);
         fs::write(repo_dir.join("index.html"), "<html></html>").expect("write index");
 
-        let port = suggest_container_port(&name, "Dockerfile", ".").expect("suggest port");
+        let port = suggest_container_port_in(&base_dir, &name, "Dockerfile", ".").expect("suggest port");
         assert_eq!(port, 80);
 
-        fs::remove_dir_all(repo_dir).ok();
+        fs::remove_dir_all(base_dir).ok();
     }
 
     #[test]
     fn suggests_next_port_3000() {
         let name = unique_name("next-port");
-        let repo_dir = prepare_repo(&name);
+        let base_dir = std::env::temp_dir().join(unique_name("dockpanel-git-base"));
+        let repo_dir = prepare_repo(&base_dir, &name);
         fs::write(
             repo_dir.join("package.json"),
             r#"{"name":"app","dependencies":{"next":"^14.0.0"}}"#,
         )
         .expect("write package.json");
 
-        let port = suggest_container_port(&name, "Dockerfile", ".").expect("suggest port");
+        let port = suggest_container_port_in(&base_dir, &name, "Dockerfile", ".").expect("suggest port");
         assert_eq!(port, 3000);
 
-        fs::remove_dir_all(repo_dir).ok();
+        fs::remove_dir_all(base_dir).ok();
     }
 }
