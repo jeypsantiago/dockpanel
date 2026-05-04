@@ -36,7 +36,7 @@ AGENT_BIN="/usr/local/bin/dockpanel-agent"
 API_BIN="/usr/local/bin/dockpanel-api"
 CLI_BIN="/usr/local/bin/dockpanel"
 INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-0}"
-GITHUB_REPO="ovexro/dockpanel"
+GITHUB_REPO="${DOCKPANEL_GITHUB_REPO:-jeypsantiago/dockpanel}"
 
 # ── Self-refresh ──────────────────────────────────────────────────────────
 # In binary-release mode, the on-disk copy of this script can lag the

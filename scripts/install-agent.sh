@@ -115,7 +115,8 @@ chmod 600 /etc/dockpanel/agent.env
 
 # Download agent binary (naming matches GitHub release assets)
 echo "[5/7] Downloading agent binary..."
-DOWNLOAD_URL="https://github.com/ovexro/dockpanel/releases/latest/download/dockpanel-agent-linux-${ARCH_LABEL}"
+GITHUB_REPO="${DOCKPANEL_GITHUB_REPO:-jeypsantiago/dockpanel}"
+DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/dockpanel-agent-linux-${ARCH_LABEL}"
 if ! curl -fsSL "$DOWNLOAD_URL" -o /usr/local/bin/dockpanel-agent; then
     echo "  Release download failed. Trying panel download..."
     if [[ -n "$PANEL_URL" ]]; then

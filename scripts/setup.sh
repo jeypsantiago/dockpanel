@@ -31,7 +31,7 @@ CLI_BIN="/usr/local/bin/dockpanel"
 DB_PORT=5450
 DB_CONTAINER="dockpanel-postgres"
 INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-0}"
-GITHUB_REPO="ovexro/dockpanel"
+GITHUB_REPO="${DOCKPANEL_GITHUB_REPO:-jeypsantiago/dockpanel}"
 
 # ── Resolve repo root ───────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
