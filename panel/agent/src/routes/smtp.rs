@@ -39,9 +39,21 @@ async fn configure(
     if body.host.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Host is required"));
     }
+    if body.username.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Username is required"));
+    }
+    if body.password.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Password is required"));
+    }
+    if body.from.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "From address is required"));
+    }
 
     let from_name = body.from_name.as_deref().unwrap_or("DockPanel");
     let encryption = body.encryption.as_deref().unwrap_or("starttls");
+    if !matches!(encryption, "starttls" | "tls" | "ssl" | "none") {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid encryption"));
+    }
 
     smtp::configure(
         &body.host,

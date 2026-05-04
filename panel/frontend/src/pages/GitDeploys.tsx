@@ -76,6 +76,17 @@ function statusBadge(status: string) {
   return map[status] || "bg-dark-700 text-dark-200";
 }
 
+function buildMethodLabel(method: string) {
+  const normalized = method === "auto-detect" ? "auto" : method;
+  const map: Record<string, string> = {
+    auto: "Auto Detect",
+    dockerfile: "Dockerfile",
+    nixpacks: "Nixpacks",
+    compose: "Docker Compose",
+  };
+  return map[normalized] || "Auto Detect";
+}
+
 export default function GitDeploys() {
   const { user } = useAuth();
   if (!user || user.role !== "admin") return <Navigate to="/" replace />;
@@ -113,6 +124,7 @@ export default function GitDeploys() {
   const [formPostDeploy, setFormPostDeploy] = useState("");
   const [formBuildArgs, setFormBuildArgs] = useState<{ key: string; value: string }[]>([]);
   const [formBuildContext, setFormBuildContext] = useState(".");
+  const [formBuildMethod, setFormBuildMethod] = useState("auto");
   const [formGithubToken, setFormGithubToken] = useState("");
   const [formCron, setFormCron] = useState("");
   const [formProtected, setFormProtected] = useState(false);
@@ -169,6 +181,7 @@ export default function GitDeploys() {
     setFormPostDeploy("");
     setFormBuildArgs([]);
     setFormBuildContext(".");
+    setFormBuildMethod("auto");
     setFormGithubToken("");
     setFormCron("");
     setFormProtected(false);
@@ -199,6 +212,7 @@ export default function GitDeploys() {
       Object.entries(selected.build_args || {}).map(([key, value]) => ({ key, value }))
     );
     setFormBuildContext(selected.build_context || ".");
+    setFormBuildMethod(selected.build_method === "auto-detect" ? "auto" : selected.build_method || "auto");
     setFormGithubToken(selected.github_token && selected.github_token !== "\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF" ? selected.github_token : "");
     setFormCron(selected.deploy_cron || "");
     setFormProtected(selected.deploy_protected || false);
@@ -232,6 +246,7 @@ export default function GitDeploys() {
       post_deploy_cmd: formPostDeploy.trim() || null,
       build_args: buildArgs,
       build_context: formBuildContext.trim() || ".",
+      build_method: formBuildMethod,
       github_token: formGithubToken.trim() || null,
       deploy_cron: formCron.trim() || null,
       deploy_protected: formProtected,
@@ -558,7 +573,7 @@ export default function GitDeploys() {
                   { label: "SSL Email", value: selected.ssl_email || "\u2014" },
                   { label: "Pre-build Cmd", value: selected.pre_build_cmd || "\u2014" },
                   { label: "Post-deploy Cmd", value: selected.post_deploy_cmd || "\u2014" },
-                  { label: "Build Method", value: selected.build_method === "nixpacks" ? "Nixpacks" : selected.build_method === "auto-detect" ? "Auto-detect" : selected.build_method === "compose" ? "Docker Compose" : "Dockerfile" },
+                  { label: "Build Method", value: buildMethodLabel(selected.build_method) },
                   { label: "Preview TTL", value: selected.preview_ttl_hours > 0 ? `${selected.preview_ttl_hours}h` : "No auto-cleanup" },
                   { label: "Build Context", value: selected.build_context || "." },
                   { label: "GitHub", value: selected.github_token ? "Connected" : "Not configured" },
@@ -899,6 +914,22 @@ export default function GitDeploys() {
                     className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 outline-none"
                   />
                 </div>
+              </div>
+
+              {/* Build Method */}
+              <div>
+                <label className="block text-sm font-medium text-dark-100 mb-1">Build Method</label>
+                <select
+                  value={formBuildMethod}
+                  onChange={(e) => setFormBuildMethod(e.target.value)}
+                  className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm bg-dark-800 focus:ring-2 focus:ring-accent-500 outline-none"
+                >
+                  <option value="auto">Auto Detect</option>
+                  <option value="dockerfile">Dockerfile</option>
+                  <option value="nixpacks">Nixpacks</option>
+                  <option value="compose">Docker Compose</option>
+                </select>
+                <p className="text-xs text-dark-300 mt-1">Auto Detect checks Compose, then Dockerfile/project type, then Nixpacks fallback</p>
               </div>
 
               {/* Port + Domain */}

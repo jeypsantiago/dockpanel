@@ -16,6 +16,28 @@ struct SettingRow {
     value: String,
 }
 
+fn canonical_setting_key<'a>(key: &'a str) -> &'a str {
+    match key {
+        "smtp_user" => "smtp_username",
+        "smtp_pass" => "smtp_password",
+        _ => key,
+    }
+}
+
+fn canonical_settings_map(rows: Vec<SettingRow>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for row in rows {
+        let key = canonical_setting_key(&row.key).to_string();
+        match map.get(&key) {
+            Some(existing) if !existing.is_empty() => {}
+            _ => {
+                map.insert(key, row.value);
+            }
+        }
+    }
+    map
+}
+
 /// GET /api/settings — Returns all settings as a key/value map (admin only).
 pub async fn list(
     State(state): State<AppState>,
@@ -27,16 +49,16 @@ pub async fn list(
         .await
         .map_err(|e| internal_error("list settings", e))?;
 
-    let map: HashMap<String, String> = rows
+    let map: HashMap<String, String> = canonical_settings_map(rows)
         .into_iter()
-        .map(|r| {
-            if (r.key == "smtp_password" || r.key == "pdns_api_key"
-                || r.key == "oauth_google_client_secret"
-                || r.key == "oauth_github_client_secret"
-                || r.key == "oauth_gitlab_client_secret") && !r.value.is_empty() {
-                (r.key, "********".to_string())
+        .map(|(key, value)| {
+            if (key == "smtp_password" || key == "pdns_api_key"
+                || key == "oauth_google_client_secret"
+                || key == "oauth_github_client_secret"
+                || key == "oauth_gitlab_client_secret") && !value.is_empty() {
+                (key, "********".to_string())
             } else {
-                (r.key, r.value)
+                (key, value)
             }
         })
         .collect();
@@ -156,7 +178,7 @@ pub async fn update(
             .await
             .map_err(|e| internal_error("update settings", e))?;
 
-        let map: HashMap<String, String> = rows.into_iter().map(|r| (r.key, r.value)).collect();
+        let map = canonical_settings_map(rows);
 
         let host = map.get("smtp_host").cloned().unwrap_or_default();
         if !host.is_empty() {
@@ -207,13 +229,37 @@ pub async fn test_email(
         .await
         .map_err(|e| internal_error("test email", e))?;
 
-    let map: HashMap<String, String> = rows.into_iter().map(|r| (r.key, r.value)).collect();
+    let map = canonical_settings_map(rows);
     let from = map.get("smtp_from").cloned().unwrap_or_default();
     let from_name = map.get("smtp_from_name").cloned().unwrap_or_else(|| "DockPanel".to_string());
+    let host = map.get("smtp_host").cloned().unwrap_or_default();
+    let port: u16 = map.get("smtp_port")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(587);
+    let username = map.get("smtp_username").cloned().unwrap_or_default();
+    let password_raw = map.get("smtp_password").cloned().unwrap_or_default();
 
-    if from.is_empty() {
-        return Err(err(StatusCode::BAD_REQUEST, "SMTP not configured — save SMTP settings first"));
+    if host.is_empty() || from.is_empty() || username.is_empty() || password_raw.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "SMTP not configured — save host, username, password, and from address first"));
     }
+
+    let password = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        &password_raw, &state.config.jwt_secret,
+    );
+    let encryption = map.get("smtp_encryption").cloned().unwrap_or_else(|| "starttls".to_string());
+    let configure_body = serde_json::json!({
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "from": from.clone(),
+        "from_name": from_name.clone(),
+        "encryption": encryption,
+    });
+    agent
+        .post("/smtp/configure", Some(configure_body))
+        .await
+        .map_err(|e| agent_error("SMTP configure", e))?;
 
     let agent_body = serde_json::json!({
         "to": to,
@@ -390,11 +436,10 @@ pub async fn export_config(
         .await
         .map_err(|e| internal_error("export config", e))?;
 
-    let map: HashMap<String, String> = rows
+    let map: HashMap<String, String> = canonical_settings_map(rows)
         .into_iter()
-        .filter(|r| r.key != "smtp_password" && r.key != "pdns_api_key"
-            && !r.key.ends_with("_client_secret"))
-        .map(|r| (r.key, r.value))
+        .filter(|(key, _)| key.as_str() != "smtp_password" && key.as_str() != "pdns_api_key"
+            && !key.ends_with("_client_secret"))
         .collect();
 
     // Gap #71: Export alert rules (user's own rules only, exclude webhook secrets)
@@ -546,6 +591,7 @@ pub async fn import_config(
     let mut imported = 0;
     let mut skipped = 0;
     for (key, value) in settings_obj {
+        let key = canonical_setting_key(key).to_string();
         if !allowed_keys.contains(&key.as_str()) {
             skipped += 1;
             continue; // Skip disallowed keys
@@ -567,7 +613,7 @@ pub async fn import_config(
                 "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) \
                  ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
             )
-            .bind(key)
+            .bind(&key)
             .bind(&store_value)
             .execute(&state.db)
             .await
