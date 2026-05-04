@@ -1384,7 +1384,7 @@ fn spawn_deploy_task(
             let msg = "Docker Compose build method selected, but no compose file was found in the build context";
             emit("compose", "Docker Compose file not found", "error", Some(msg.to_string()));
             emit("complete", "Deploy failed", "error", None);
-            record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, msg, &triggered_by).await;
+            record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, msg, &triggered).await;
             if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
                 .bind(git_deploy_id).execute(&db).await
             {
@@ -1403,8 +1403,8 @@ fn spawn_deploy_task(
             }))).await {
                 Ok(result) => result,
                 Err(e) => {
-                    tracing::error!("Auto-detect failed ({}): {}: {e}", triggered_by, config.name);
-                    record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, &format!("Auto-detect failed: {e}"), &triggered_by).await;
+                    tracing::error!("Auto-detect failed ({}): {}: {e}", triggered, config.name);
+                    record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, &format!("Auto-detect failed: {e}"), &triggered).await;
                     if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
                         .bind(git_deploy_id).execute(&db).await
                     {
@@ -1455,8 +1455,8 @@ fn spawn_deploy_task(
                     result.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string()
                 }
                 Err(e) => {
-                    tracing::error!("Nixpacks build failed ({}): {}: {e}", triggered_by, config.name);
-                    record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, &format!("Nixpacks build failed: {e}"), &triggered_by).await;
+                    tracing::error!("Nixpacks build failed ({}): {}: {e}", triggered, config.name);
+                    record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, &format!("Nixpacks build failed: {e}"), &triggered).await;
                     if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
                         .bind(git_deploy_id).execute(&db).await
                     {
@@ -1473,7 +1473,7 @@ fn spawn_deploy_task(
                 Ok(result) => result.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
                 Err(e) => {
                     tracing::error!("Scheduled deploy build failed: {}: {e}", config.name);
-                    record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, &format!("Build failed: {e}"), &triggered_by).await;
+                    record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, &format!("Build failed: {e}"), &triggered).await;
                     if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
                         .bind(git_deploy_id).execute(&db).await
                     {
