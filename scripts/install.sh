@@ -11,6 +11,7 @@ set -euo pipefail
 
 VERSION="${DOCKPANEL_VERSION:-main}"
 INSTALL_DIR="/opt/dockpanel"
+REPO_URL="${DOCKPANEL_REPO_URL:-https://github.com/jeypsantiago/dockpanel.git}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -60,7 +61,7 @@ if [ -d "$INSTALL_DIR/.git" ]; then
 else
     echo -e "${GREEN}[+]${NC} Downloading DockPanel..."
     rm -rf "$INSTALL_DIR"
-    git clone --depth 1 -b "$VERSION" https://github.com/ovexro/dockpanel.git "$INSTALL_DIR"
+    git clone --depth 1 -b "$VERSION" "$REPO_URL" "$INSTALL_DIR"
 fi
 
 # Default to pre-built binaries unless BUILD_FROM_SOURCE=1

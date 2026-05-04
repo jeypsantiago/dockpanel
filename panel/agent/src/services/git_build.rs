@@ -233,8 +233,8 @@ pub async fn build_image(
 /// Deploy or update a container from a locally-built git image.
 ///
 /// - New container: create + start. If domain is provided, set up nginx reverse proxy.
-/// - Existing container with domain + nginx config: blue-green zero-downtime update.
-/// - Existing container without domain: stop old, remove, create new, start.
+/// - Existing container with matching domain + nginx config: blue-green zero-downtime update.
+/// - Existing container with missing/stale domain config: recreate and reconcile nginx/SSL.
 pub async fn deploy_or_update(
     name: &str,
     image_tag: &str,
@@ -251,6 +251,7 @@ pub async fn deploy_or_update(
         Docker::connect_with_local_defaults().map_err(|e| format!("Docker connect failed: {e}"))?;
 
     let container_name = format!("dockpanel-git-{name}");
+    let domain = domain.map(str::trim);
 
     // Build environment list
     let env_list: Vec<String> = env_vars
@@ -309,17 +310,20 @@ pub async fn deploy_or_update(
 
     match existing {
         Some((container_id, existing_domain, existing_port)) => {
-            // Container exists — check if blue-green is possible
-            let has_nginx = existing_domain.is_some()
+            let existing_domain_ref = existing_domain.as_deref();
+            let domain_matches = domain.is_some() && existing_domain_ref == domain;
+
+            // Container exists — check if blue-green is possible for the same domain.
+            let has_nginx = domain_matches
                 && existing_port.is_some()
                 && std::path::Path::new(&format!(
                     "/etc/nginx/sites-enabled/{}.conf",
-                    existing_domain.as_deref().unwrap_or("")
+                    existing_domain_ref.unwrap_or("")
                 ))
                 .exists();
 
             if has_nginx {
-                let bg_domain = existing_domain.as_deref().unwrap();
+                let bg_domain = existing_domain_ref.unwrap();
                 let old_port = existing_port.unwrap();
 
                 tracing::info!(
@@ -341,8 +345,8 @@ pub async fn deploy_or_update(
                 .await;
             }
 
-            // No domain/nginx — stop + remove + recreate
-            tracing::info!("Replacing git container {container_name} (no domain, stop/start)");
+            // Domain changed or nginx config is missing/stale — stop + remove + recreate.
+            tracing::info!("Replacing git container {container_name} and reconciling routing");
 
             docker
                 .stop_container(&container_id, Some(StopContainerOptions { t: 10 }))
@@ -371,6 +375,19 @@ pub async fn deploy_or_update(
             )
             .await?;
 
+            if let Some(d) = domain {
+                provision_git_domain(
+                    templates,
+                    d,
+                    host_port,
+                    ssl_email,
+                    existing_domain_ref,
+                )
+                .await?;
+            } else if let Some(old_domain) = existing_domain_ref {
+                remove_git_domain_artifacts(old_domain).await?;
+            }
+
             Ok(GitDeployResult {
                 container_id: result,
                 blue_green: false,
@@ -391,51 +408,8 @@ pub async fn deploy_or_update(
             )
             .await?;
 
-            // Set up nginx reverse proxy if domain is provided
             if let Some(d) = domain {
-                setup_nginx_proxy(templates, d, host_port).await?;
-
-                // After successful nginx setup for initial deploy with domain
-                if let Some(email) = ssl_email {
-                    // DNS propagation wait
-                    for i in 0..6u32 {
-                        if i > 0 { tokio::time::sleep(std::time::Duration::from_secs(5)).await; }
-                        match tokio::net::TcpStream::connect(format!("{}:80", d)).await {
-                            Ok(_) => break,
-                            Err(_) if i < 5 => continue,
-                            Err(_) => break,
-                        }
-                    }
-                    match crate::services::ssl::load_or_create_account(email).await {
-                        Ok(account) => {
-                            match crate::services::ssl::provision_cert(&account, d, None).await {
-                                Ok(_) => {
-                                    let ssl_config = crate::routes::nginx::SiteConfig {
-                                        runtime: "proxy".to_string(), root: None,
-                                        proxy_port: Some(host_port), php_socket: None,
-                                        ssl: None, ssl_cert: None, ssl_key: None,
-                                        rate_limit: None, max_upload_mb: None,
-                                        php_memory_mb: None, php_max_workers: None,
-                                        custom_nginx: None, php_preset: None, app_command: None,
-                                        fastcgi_cache: None,
-                                        redis_cache: None,
-                                        redis_db: None,
-                                        waf_enabled: None,
-                                        waf_mode: None,
-        csp_policy: None,
-        permissions_policy: None,
-        bot_protection: None,
-                                    };
-                                    if let Ok(()) = crate::services::ssl::enable_ssl_for_site(templates, d, &ssl_config).await {
-                                        tracing::info!("Auto-SSL: certificate provisioned for {d}");
-                                    }
-                                }
-                                Err(e) => tracing::warn!("Auto-SSL: cert provisioning failed for {d}: {e}"),
-                            }
-                        }
-                        Err(e) => tracing::warn!("Auto-SSL: ACME account failed for {d}: {e}"),
-                    }
-                }
+                provision_git_domain(templates, d, host_port, ssl_email, None).await?;
             }
 
             Ok(GitDeployResult {
@@ -647,8 +621,17 @@ pub fn auto_generate_dockerfile(name: &str, dockerfile_path: &str, build_context
             "FROM python:3.12-slim\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY . .\nEXPOSE 8000\nCMD [\"python\", \"app.py\"]\n".to_string()
         }
     } else if std::path::Path::new(&context_dir).join("go.mod").exists() {
+        let pocketbase_main = std::path::Path::new(&context_dir)
+            .join("examples")
+            .join("base")
+            .join("main.go");
+        if pocketbase_main.exists() {
+            // PocketBase repo root is not the runnable package; build the example app instead.
+            "FROM golang:1.25-alpine AS builder\nWORKDIR /src\nCOPY go.mod go.sum ./\nRUN go mod download\nCOPY . .\nRUN CGO_ENABLED=0 go build -o /out/pocketbase ./examples/base\n\nFROM alpine:3.20\nRUN adduser -D -H -h /pb_data pocketbase \\\n    && mkdir -p /pb_data /pb_public /pb_hooks /pb_migrations \\\n    && chown -R pocketbase:pocketbase /pb_data /pb_public /pb_hooks /pb_migrations\nCOPY --from=builder /out/pocketbase /usr/local/bin/pocketbase\nUSER pocketbase\nWORKDIR /pb\nEXPOSE 3000\nCMD [\"pocketbase\", \"serve\", \"--http=0.0.0.0:3000\", \"--dir=/pb_data\", \"--publicDir=/pb_public\", \"--hooksDir=/pb_hooks\", \"--migrationsDir=/pb_migrations\"]\n".to_string()
+        } else {
         // Go
         "FROM golang:1.24-alpine AS builder\nWORKDIR /app\nCOPY go.mod go.sum ./\nRUN go mod download\nCOPY . .\nRUN CGO_ENABLED=0 go build -o server .\n\nFROM alpine:3.20\nWORKDIR /app\nCOPY --from=builder /app/server .\nEXPOSE 8080\nCMD [\"./server\"]\n".to_string()
+        }
     } else if std::path::Path::new(&context_dir).join("Cargo.toml").exists() {
         // Rust
         "FROM rust:1.94-slim AS builder\nWORKDIR /app\nCOPY . .\nRUN cargo build --release\n\nFROM debian:bookworm-slim\nCOPY --from=builder /app/target/release/* /usr/local/bin/\nEXPOSE 8080\nCMD [\"app\"]\n".to_string()
@@ -834,6 +817,108 @@ async fn setup_nginx_proxy(
             return Err(format!(
                 "Nginx config test failed for {domain}, config removed"
             ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove stale nginx + SSL artifacts for a git domain and reload nginx when needed.
+async fn remove_git_domain_artifacts(domain: &str) -> Result<(), String> {
+    let mut removed_nginx = false;
+
+    let config_path = format!("/etc/nginx/sites-enabled/{domain}.conf");
+    if std::path::Path::new(&config_path).exists() {
+        std::fs::remove_file(&config_path).map_err(|e| {
+            format!("Failed to remove stale nginx config {config_path}: {e}")
+        })?;
+        removed_nginx = true;
+        tracing::info!("Removed stale nginx config: {config_path}");
+    }
+
+    let ssl_dir = format!("/etc/dockpanel/ssl/{domain}");
+    if std::path::Path::new(&ssl_dir).exists() {
+        std::fs::remove_dir_all(&ssl_dir)
+            .map_err(|e| format!("Failed to remove stale SSL dir {ssl_dir}: {e}"))?;
+        tracing::info!("Removed stale SSL certs: {ssl_dir}");
+    }
+
+    if removed_nginx {
+        match crate::services::nginx::test_config().await {
+            Ok(output) if output.success => {
+                crate::services::nginx::reload().await.ok();
+            }
+            _ => {
+                tracing::warn!("Nginx test failed after removing stale config for {domain}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Provision nginx and optional SSL for a git deployment domain.
+async fn provision_git_domain(
+    templates: &Tera,
+    domain: &str,
+    host_port: u16,
+    ssl_email: Option<&str>,
+    previous_domain: Option<&str>,
+) -> Result<(), String> {
+    if let Some(old_domain) = previous_domain.filter(|old| *old != domain) {
+        remove_git_domain_artifacts(old_domain).await?;
+    }
+
+    setup_nginx_proxy(templates, domain, host_port).await?;
+
+    if let Some(email) = ssl_email {
+        // DNS propagation wait
+        for i in 0..6u32 {
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            match tokio::net::TcpStream::connect(format!("{domain}:80")).await {
+                Ok(_) => break,
+                Err(_) if i < 5 => continue,
+                Err(_) => break,
+            }
+        }
+        match crate::services::ssl::load_or_create_account(email).await {
+            Ok(account) => match crate::services::ssl::provision_cert(&account, domain, None).await {
+                Ok(_) => {
+                    let ssl_config = crate::routes::nginx::SiteConfig {
+                        runtime: "proxy".to_string(),
+                        root: None,
+                        proxy_port: Some(host_port),
+                        php_socket: None,
+                        ssl: None,
+                        ssl_cert: None,
+                        ssl_key: None,
+                        rate_limit: None,
+                        max_upload_mb: None,
+                        php_memory_mb: None,
+                        php_max_workers: None,
+                        custom_nginx: None,
+                        php_preset: None,
+                        app_command: None,
+                        fastcgi_cache: None,
+                        redis_cache: None,
+                        redis_db: None,
+                        waf_enabled: None,
+                        waf_mode: None,
+                        csp_policy: None,
+                        permissions_policy: None,
+                        bot_protection: None,
+                    };
+                    if let Ok(()) =
+                        crate::services::ssl::enable_ssl_for_site(templates, domain, &ssl_config).await
+                    {
+                        tracing::info!("Auto-SSL: certificate provisioned for {domain}");
+                    }
+                }
+                Err(e) => tracing::warn!("Auto-SSL: cert provisioning failed for {domain}: {e}"),
+            },
+            Err(e) => tracing::warn!("Auto-SSL: ACME account failed for {domain}: {e}"),
         }
     }
 

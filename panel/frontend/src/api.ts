@@ -52,7 +52,14 @@ async function request<T = unknown>(
   if (!res.ok) {
     let message = (data as { error?: string }).error || `Request failed (${res.status})`;
     // Translate common backend errors into user-friendly messages
-    if (res.status === 502 || message.includes("agent connection failed")) {
+    const lowerMessage = message.toLowerCase();
+    const isAgentPath = path.startsWith("/agent") || path.startsWith("/settings/health");
+    const isAgentFailure =
+      lowerMessage.includes("agent connection failed") ||
+      lowerMessage.includes("agent offline") ||
+      lowerMessage.includes("dockpanel agent");
+
+    if ((res.status === 502 && isAgentPath) || isAgentFailure) {
       message = "Agent offline — the DockPanel agent is not responding.";
     }
     throw new ApiError(res.status, message);

@@ -198,6 +198,7 @@ log "Ensuring required directories exist..."
 mkdir -p /etc/dockpanel/ssl /var/run/dockpanel /var/backups/dockpanel
 mkdir -p /var/www/acme/.well-known/acme-challenge
 mkdir -p /var/lib/dockpanel/git
+mkdir -p /var/lib/dockpanel/docker
 # Directories needed by agent ReadWritePaths (created only if missing).
 # v2.8.13 expanded the RWP list — systemd fails the namespace mount on
 # missing entries, so pre-create everything the canonical unit references.

@@ -87,6 +87,21 @@ fn cf_client(token: &str, email: Option<&str>) -> Result<(reqwest::Client, reqwe
     Ok((client, headers))
 }
 
+fn cf_error_message(data: &serde_json::Value, default: &str) -> String {
+    data.get("errors")
+        .and_then(|e| e.as_array())
+        .and_then(|a| a.first())
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn cf_api_error(status: reqwest::StatusCode, data: &serde_json::Value, default: &str) -> ApiError {
+    let api_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    err(api_status, &cf_error_message(data, default))
+}
+
 // ── PowerDNS helpers ────────────────────────────────────────────────────
 
 /// Get PowerDNS settings from DB.
@@ -1385,10 +1400,15 @@ pub async fn cf_zone_settings(
             .await
             .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string()))?;
 
+        let status = resp.status();
         let data: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string()))?;
+
+        if !status.is_success() {
+            return Err(cf_api_error(status, &data, &format!("Failed to fetch Cloudflare setting '{key}'")));
+        }
 
         if let Some(result) = data.get("result") {
             if let Some(value) = result.get("value") {
@@ -1484,13 +1504,7 @@ pub async fn cf_update_setting(
         .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string()))?;
 
     if !status.is_success() {
-        let cf_err = data.get("errors")
-            .and_then(|e| e.as_array())
-            .and_then(|a| a.first())
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("Unknown Cloudflare error");
-        return Err(err(StatusCode::BAD_GATEWAY, cf_err));
+        return Err(cf_api_error(status, &data, "Unknown Cloudflare error"));
     }
 
     tracing::info!("CF setting updated: {setting}={value} for zone {}", zone.domain);

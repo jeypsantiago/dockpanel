@@ -7,12 +7,14 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sh -c 'mkdir -p /run/dockpanel /var/lib/dockpanel/git'
+ExecStartPre=/bin/sh -c 'mkdir -p /run/dockpanel /var/lib/dockpanel/git /var/lib/dockpanel/docker'
 ExecStart=/usr/local/bin/dockpanel-agent
 ExecStartPost=/bin/sh -c 'sleep 1 && chgrp $(getent group www-data >/dev/null 2>&1 && echo www-data || echo nginx) /var/run/dockpanel/agent.sock 2>/dev/null; chmod 660 /var/run/dockpanel/agent.sock 2>/dev/null; true'
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=info
+Environment=HOME=/var/lib/dockpanel
+Environment=DOCKER_CONFIG=/var/lib/dockpanel/docker
 
 # Sandbox hardening (v2.8.13). apt/dpkg/snap/composer-rm operations that need to
 # write outside ReadWritePaths escape via systemd-run — see safe_command_unsandboxed

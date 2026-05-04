@@ -32,6 +32,8 @@ curl -sL https://dockpanel.dev/install.sh | sudo bash
 
 Open `http://YOUR_SERVER_IP:8443`, create your admin account, done.
 
+The installer defaults to your fork and can be pointed at another repo by setting `DOCKPANEL_REPO_URL`.
+
 Supports Ubuntu 20+, Debian 11+, CentOS 9+, Rocky 9+, Fedora 39+, Amazon Linux 2023. x86_64 and ARM64.
 
 ## Why DockPanel?

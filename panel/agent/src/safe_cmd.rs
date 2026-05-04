@@ -7,12 +7,17 @@
 
 /// Minimal safe PATH containing only system directories.
 const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// Dedicated writable home for sandboxed child commands.
+const SAFE_HOME: &str = "/var/lib/dockpanel";
+/// Docker CLI config directory inside the writable home.
+const SAFE_DOCKER_CONFIG: &str = "/var/lib/dockpanel/docker";
 
 /// Create an async `tokio::process::Command` with a sanitized environment.
 ///
 /// The child process starts with an **empty** environment and only receives:
 /// - `PATH`  – system directories only
-/// - `HOME`  – `/root`
+/// - `HOME`  – `/var/lib/dockpanel`
+/// - `DOCKER_CONFIG` – `/var/lib/dockpanel/docker`
 /// - `LANG`  – `C.UTF-8`
 /// - `LC_ALL` – `C.UTF-8`
 ///
@@ -22,7 +27,8 @@ pub fn safe_command(binary: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(binary);
     cmd.env_clear();
     cmd.env("PATH", SAFE_PATH);
-    cmd.env("HOME", "/root");
+    cmd.env("HOME", SAFE_HOME);
+    cmd.env("DOCKER_CONFIG", SAFE_DOCKER_CONFIG);
     cmd.env("LANG", "C.UTF-8");
     cmd.env("LC_ALL", "C.UTF-8");
     cmd
@@ -36,7 +42,8 @@ pub fn safe_command_sync(binary: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(binary);
     cmd.env_clear();
     cmd.env("PATH", SAFE_PATH);
-    cmd.env("HOME", "/root");
+    cmd.env("HOME", SAFE_HOME);
+    cmd.env("DOCKER_CONFIG", SAFE_DOCKER_CONFIG);
     cmd.env("LANG", "C.UTF-8");
     cmd.env("LC_ALL", "C.UTF-8");
     cmd

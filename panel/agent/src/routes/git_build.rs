@@ -462,15 +462,23 @@ async fn auto_detect(Json(body): Json<AutoDetectRequest>) -> Result<Json<serde_j
     let context_dir = if body.build_context == "." { deploy_dir.clone() } else { format!("{deploy_dir}/{}", body.build_context) };
     let original_exists = std::path::Path::new(&context_dir).join(&body.dockerfile).exists();
 
-    let dockerfile = git_build::auto_generate_dockerfile(&body.name, &body.dockerfile, &body.build_context)
-        .map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, &e))?;
-
-    // auto_generated is true only if the original didn't exist (meaning the function created one)
-    let auto_generated = !original_exists;
+    let (dockerfile, auto_generated, build_method) = if original_exists {
+        (
+            body.dockerfile.clone(),
+            false,
+            "dockerfile".to_string(),
+        )
+    } else {
+        match git_build::auto_generate_dockerfile(&body.name, &body.dockerfile, &body.build_context) {
+            Ok(dockerfile) => (dockerfile, true, "dockerfile".to_string()),
+            Err(_) => (body.dockerfile.clone(), false, "nixpacks".to_string()),
+        }
+    };
 
     Ok(Json(serde_json::json!({
         "dockerfile": dockerfile,
         "auto_generated": auto_generated,
+        "build_method": build_method,
     })))
 }
 

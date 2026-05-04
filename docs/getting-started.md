@@ -28,9 +28,11 @@ The installer will:
 
 1. Detect your OS and package manager
 2. Install Docker, Nginx, PHP-FPM, Certbot, UFW, and Fail2Ban
-3. Clone the DockPanel repository to `/opt/dockpanel`
+3. Clone your fork of DockPanel to `/opt/dockpanel`
 4. Build and start the agent, API, and frontend services
 5. Configure Nginx as a reverse proxy on port 8443
+
+To point the installer at a different fork, set `DOCKPANEL_REPO_URL` before piping it into `sudo bash`.
 
 On ARM64 servers with less than 2GB RAM, the installer automatically uses pre-built binaries instead of compiling from source.
 

@@ -1334,149 +1334,106 @@ fn spawn_deploy_task(
             return; // Skip single-container deployment path
         }
 
-        // Try Nixpacks first, then fall back to auto-detect
-        let mut nixpacks_image: Option<String> = None;
-        emit("detect", "Detecting build method", "in_progress", None);
-        match agent.post_long("/git/nixpacks-build", Some(serde_json::json!({
-            "name": config.name,
-            "commit_hash": commit_hash,
-            "build_context": &config.build_context,
-            "env_vars": config.env_vars,
-        })), 660).await {
-            Ok(result) => {
-                nixpacks_image = result.get("image_tag").and_then(|v| v.as_str()).map(|s| s.to_string());
-                emit("detect", "Built with Nixpacks", "done", None);
-                if let Err(db_err) = sqlx::query("UPDATE git_deploys SET build_method = 'nixpacks', updated_at = NOW() WHERE id = $1")
+        let detect_result = match agent.post("/git/auto-detect", Some(serde_json::json!({
+            "name": config.name, "dockerfile": config.dockerfile, "build_context": config.build_context,
+        }))).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("Auto-detect failed ({}): {}: {e}", triggered_by, config.name);
+                record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &format!("Auto-detect failed: {e}"), &triggered_by).await;
+                if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
                     .bind(git_deploy_id).execute(&db).await
                 {
-                    tracing::warn!("Failed to update git deploy build method: {db_err}");
+                    tracing::warn!("Failed to update git deploy status: {db_err}");
                 }
+                return;
             }
-            Err(_) => {
-                // Nixpacks failed or not available — fall back to auto-detect
-                match agent.post("/git/auto-detect", Some(serde_json::json!({
-                    "name": config.name, "dockerfile": config.dockerfile, "build_context": config.build_context,
-                }))).await {
-                    Ok(result) => {
-                        let auto = result.get("auto_generated").and_then(|v| v.as_bool()).unwrap_or(false);
-                        if auto {
-                            emit("detect", "Auto-detected project type", "done", None);
-                            if let Err(db_err) = sqlx::query("UPDATE git_deploys SET build_method = 'auto-detect', updated_at = NOW() WHERE id = $1")
-                                .bind(git_deploy_id).execute(&db).await
-                            {
-                                tracing::warn!("Failed to update git deploy build method: {db_err}");
-                            }
-                        } else {
-                            emit("detect", "Using existing Dockerfile", "done", None);
-                            if let Err(db_err) = sqlx::query("UPDATE git_deploys SET build_method = 'dockerfile', updated_at = NOW() WHERE id = $1")
-                                .bind(git_deploy_id).execute(&db).await
-                            {
-                                tracing::warn!("Failed to update git deploy build method: {db_err}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        emit("detect", "No Dockerfile and auto-detect failed", "error", Some(format!("{e}")));
-                        emit("complete", "Deploy failed", "error", None);
-                        let duration_ms = started.elapsed().as_millis() as i32;
-                        if let Err(db_err) = sqlx::query("INSERT INTO git_deploy_history (git_deploy_id, commit_hash, commit_message, image_tag, status, output, triggered_by, duration_ms) VALUES ($1, $2, $3, '', 'failed', $4, $5, $6)")
-                            .bind(git_deploy_id).bind(&commit_hash).bind(&commit_message)
-                            .bind(format!("Auto-detect failed: {e}")).bind(&triggered).bind(duration_ms)
-                            .execute(&db).await
-                        {
-                            tracing::warn!("Failed to record git deploy history: {db_err}");
-                        }
-                        if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
-                            .bind(git_deploy_id).execute(&db).await
-                        {
-                            tracing::warn!("Failed to update git deploy status: {db_err}");
-                        }
-                        tokio::time::sleep(Duration::from_secs(60)).await;
-                        logs.lock().unwrap_or_else(|e| e.into_inner()).remove(&deploy_id);
-                        return;
-                    }
-                }
-            }
+        };
+
+        let build_method = detect_result.get("build_method").and_then(|v| v.as_str()).unwrap_or("nixpacks");
+        let detected_dockerfile = detect_result
+            .get("dockerfile")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&config.dockerfile);
+        let auto_generated = detect_result.get("auto_generated").and_then(|v| v.as_bool()).unwrap_or(false);
+        if build_method == "nixpacks" {
+            tracing::info!("Using Nixpacks for {}", config.name);
+        } else if auto_generated {
+            tracing::info!("Auto-detected project type for {}", config.name);
+        } else {
+            tracing::info!("Using existing Dockerfile for {}", config.name);
+        }
+
+        if let Err(db_err) = sqlx::query("UPDATE git_deploys SET build_method = $1, updated_at = NOW() WHERE id = $2")
+            .bind(if build_method == "nixpacks" {
+                "nixpacks"
+            } else if auto_generated {
+                "auto-detect"
+            } else {
+                "dockerfile"
+            })
+            .bind(git_deploy_id).execute(&db).await
+        {
+            tracing::warn!("Failed to update git deploy build method: {db_err}");
         }
 
         // Pre-build hook (runs in git dir on host, before docker build)
         if let Some(ref cmd) = config.pre_build_cmd {
             if !cmd.trim().is_empty() {
-                emit("pre_build", "Running pre-build hook", "in_progress", None);
-                match agent.post_long("/git/pre-build-hook", Some(serde_json::json!({ "name": config.name, "command": cmd })), 330).await {
-                    Ok(result) => {
-                        let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                        if success {
-                            emit("pre_build", "Running pre-build hook", "done", None);
-                        } else {
-                            let output = result.get("output").and_then(|v| v.as_str()).unwrap_or("");
-                            emit("pre_build", "Pre-build hook failed", "error", Some(output.to_string()));
+                let _ = agent.post_long("/git/pre-build-hook", Some(serde_json::json!({
+                    "name": config.name, "command": cmd,
+                })), 330).await;
+            }
+        }
+
+        // Build using the detected strategy.
+        let image_tag = if build_method == "nixpacks" {
+            match agent.post_long("/git/nixpacks-build", Some(serde_json::json!({
+                "name": config.name,
+                "commit_hash": commit_hash,
+                "build_context": &config.build_context,
+                "env_vars": config.env_vars,
+            })), 660).await {
+                Ok(result) => {
+                    tracing::info!("Nixpacks build succeeded for {}", config.name);
+                    result.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string()
+                }
+                Err(e) => {
+                    tracing::error!("Nixpacks build failed ({}): {}: {e}", triggered_by, config.name);
+                    record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &format!("Nixpacks build failed: {e}"), &triggered_by).await;
+                    if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
+                        .bind(git_deploy_id).execute(&db).await
+                    {
+                        tracing::warn!("Failed to update git deploy status: {db_err}");
+                    }
+                    return;
+                }
+            }
+        } else {
+            match agent.post_long("/git/build", Some(serde_json::json!({
+                "name": config.name, "dockerfile": detected_dockerfile, "commit_hash": commit_hash,
+                "build_args": config.build_args, "build_context": config.build_context,
+            })), 660).await {
+                Ok(result) => result.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+                Err(e) => {
+                    tracing::error!("Scheduled deploy build failed: {}: {e}", config.name);
+                    record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &format!("Build failed: {e}"), &triggered_by).await;
+                    if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
+                        .bind(git_deploy_id).execute(&db).await
+                    {
+                        tracing::warn!("Failed to update git deploy status: {db_err}");
+                    }
+                    if let Some(ref gh_token) = config.github_token {
+                        if !gh_token.is_empty() && commit_hash != "unknown" {
+                            set_github_status(gh_token, &config.repo_url, &commit_hash, "failure", config.domain.as_deref()).await;
                         }
                     }
-                    Err(e) => {
-                        emit("pre_build", "Pre-build hook failed", "error", Some(format!("{e}")));
-                    }
+                    return;
                 }
             }
-        }
+        };
 
-        // Step 2: Build (skip if nixpacks already built the image)
-        let image_tag = if let Some(tag) = nixpacks_image {
-            emit("build", "Image built by Nixpacks", "done", None);
-            tag
-        } else {
-        emit("build", "Building Docker image", "in_progress", None);
-
-        let build_body = serde_json::json!({
-            "name": config.name,
-            "dockerfile": config.dockerfile,
-            "commit_hash": commit_hash,
-            "build_args": config.build_args,
-            "build_context": config.build_context,
-        });
-
-        match agent.post_long("/git/build", Some(build_body), 660).await {
-            Ok(result) => {
-                emit("build", "Building Docker image", "done", None);
-                result.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string()
-            }
-            Err(e) => {
-                emit("build", "Building Docker image", "error", Some(format!("{e}")));
-                emit("complete", "Deploy failed", "error", None);
-
-                let duration_ms = started.elapsed().as_millis() as i32;
-                if let Err(db_err) = sqlx::query(
-                    "INSERT INTO git_deploy_history (git_deploy_id, commit_hash, commit_message, image_tag, status, output, triggered_by, duration_ms) \
-                     VALUES ($1, $2, $3, $4, 'failed', $5, $6, $7)",
-                )
-                .bind(git_deploy_id)
-                .bind(&commit_hash)
-                .bind(&commit_message)
-                .bind("")
-                .bind(format!("Build failed: {e}"))
-                .bind(&triggered)
-                .bind(duration_ms)
-                .execute(&db)
-                .await
-                {
-                    tracing::warn!("Failed to record git deploy history: {db_err}");
-                }
-
-                if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
-                    .bind(git_deploy_id)
-                    .execute(&db)
-                    .await
-                {
-                    tracing::warn!("Failed to update git deploy status: {db_err}");
-                }
-
-                tracing::error!("Git deploy build failed: {deploy_name}: {e}");
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                logs.lock().unwrap_or_else(|e| e.into_inner()).remove(&deploy_id);
-                return;
-            }
-        }
-        }; // end nixpacks_image if/else
+        // Deploy
 
         // Step 3: Deploy
         emit("deploy", "Deploying container", "in_progress", None);
@@ -2040,26 +1997,12 @@ pub async fn trigger_deploy_task(
         }
     }
 
-    // Try Nixpacks first, then fall back to auto-detect + docker build
-    let mut nixpacks_image: Option<String> = None;
-    if let Ok(result) = agent.post_long("/git/nixpacks-build", Some(serde_json::json!({
-        "name": config.name,
-        "commit_hash": commit_hash,
-        "build_context": &config.build_context,
-        "env_vars": config.env_vars,
-    })), 660).await {
-        nixpacks_image = result.get("image_tag").and_then(|v| v.as_str()).map(|s| s.to_string());
-        tracing::info!("Nixpacks build succeeded for {}", config.name);
-        if let Err(db_err) = sqlx::query("UPDATE git_deploys SET build_method = 'nixpacks', updated_at = NOW() WHERE id = $1")
-            .bind(git_deploy_id).execute(&db).await
-        {
-            tracing::warn!("Failed to update git deploy build method: {db_err}");
-        }
-    } else {
-        // Nixpacks unavailable — try auto-detect
-        if let Err(e) = agent.post("/git/auto-detect", Some(serde_json::json!({
-            "name": config.name, "dockerfile": config.dockerfile, "build_context": config.build_context,
-        }))).await {
+    // Detect the best build strategy first, then run the matching builder.
+    let detect_result = match agent.post("/git/auto-detect", Some(serde_json::json!({
+        "name": config.name, "dockerfile": config.dockerfile, "build_context": config.build_context,
+    }))).await {
+        Ok(result) => result,
+        Err(e) => {
             tracing::error!("Auto-detect failed ({}): {}: {e}", triggered_by, config.name);
             record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &format!("Auto-detect failed: {e}"), &triggered_by).await;
             if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
@@ -2069,6 +2012,33 @@ pub async fn trigger_deploy_task(
             }
             return;
         }
+    };
+
+    let build_method = detect_result.get("build_method").and_then(|v| v.as_str()).unwrap_or("nixpacks");
+    let detected_dockerfile = detect_result
+        .get("dockerfile")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&config.dockerfile);
+    let auto_generated = detect_result.get("auto_generated").and_then(|v| v.as_bool()).unwrap_or(false);
+    if build_method == "nixpacks" {
+        emit("detect", "Using Nixpacks", "done", None);
+    } else if auto_generated {
+        emit("detect", "Auto-detected project type", "done", None);
+    } else {
+        emit("detect", "Using existing Dockerfile", "done", None);
+    }
+
+    if let Err(db_err) = sqlx::query("UPDATE git_deploys SET build_method = $1, updated_at = NOW() WHERE id = $2")
+        .bind(if build_method == "nixpacks" {
+            "nixpacks"
+        } else if auto_generated {
+            "auto-detect"
+        } else {
+            "dockerfile"
+        })
+        .bind(git_deploy_id).execute(&db).await
+    {
+        tracing::warn!("Failed to update git deploy build method: {db_err}");
     }
 
     // Pre-build hook
@@ -2080,12 +2050,33 @@ pub async fn trigger_deploy_task(
         }
     }
 
-    // Build (skip if nixpacks already built the image)
-    let image_tag = if let Some(tag) = nixpacks_image {
-        tag
+    // Build using the detected strategy.
+    let image_tag = if build_method == "nixpacks" {
+        match agent.post_long("/git/nixpacks-build", Some(serde_json::json!({
+            "name": config.name,
+            "commit_hash": commit_hash,
+            "build_context": &config.build_context,
+            "env_vars": config.env_vars,
+        })), 660).await {
+            Ok(result) => {
+                let tag = result.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                tracing::info!("Nixpacks build succeeded for {}", config.name);
+                tag
+            }
+            Err(e) => {
+                tracing::error!("Nixpacks build failed ({}): {}: {e}", triggered_by, config.name);
+                record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &format!("Nixpacks build failed: {e}"), &triggered_by).await;
+                if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
+                    .bind(git_deploy_id).execute(&db).await
+                {
+                    tracing::warn!("Failed to update git deploy status: {db_err}");
+                }
+                return;
+            }
+        }
     } else {
         match agent.post_long("/git/build", Some(serde_json::json!({
-            "name": config.name, "dockerfile": config.dockerfile, "commit_hash": commit_hash,
+            "name": config.name, "dockerfile": detected_dockerfile, "commit_hash": commit_hash,
             "build_args": config.build_args, "build_context": config.build_context,
         })), 660).await {
             Ok(r) => r.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
