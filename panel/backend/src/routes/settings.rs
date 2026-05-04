@@ -25,7 +25,7 @@ fn canonical_setting_key<'a>(key: &'a str) -> &'a str {
 }
 
 fn canonical_settings_map(rows: Vec<SettingRow>) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+    let mut map: HashMap<String, String> = HashMap::new();
     for row in rows {
         let key = canonical_setting_key(&row.key).to_string();
         match map.get(&key) {

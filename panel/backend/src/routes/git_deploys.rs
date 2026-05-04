@@ -766,7 +766,6 @@ pub async fn rollback(
                 }
             }
         };
-
         // Skip clone+build — go straight to deploy with the historical image
         emit("deploy", "Rolling back container", "in_progress", None);
 
@@ -1302,6 +1301,7 @@ fn spawn_deploy_task(
                 return;
             }
         };
+        let commit_message_text = commit_message.as_deref().unwrap_or("");
 
         let configured_build_method = match config.build_method.as_str() {
             "dockerfile" => "dockerfile",
@@ -1384,7 +1384,7 @@ fn spawn_deploy_task(
             let msg = "Docker Compose build method selected, but no compose file was found in the build context";
             emit("compose", "Docker Compose file not found", "error", Some(msg.to_string()));
             emit("complete", "Deploy failed", "error", None);
-            record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, msg, &triggered_by).await;
+            record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, msg, &triggered_by).await;
             if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
                 .bind(git_deploy_id).execute(&db).await
             {
@@ -1404,7 +1404,7 @@ fn spawn_deploy_task(
                 Ok(result) => result,
                 Err(e) => {
                     tracing::error!("Auto-detect failed ({}): {}: {e}", triggered_by, config.name);
-                    record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &format!("Auto-detect failed: {e}"), &triggered_by).await;
+                    record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, &format!("Auto-detect failed: {e}"), &triggered_by).await;
                     if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
                         .bind(git_deploy_id).execute(&db).await
                     {
@@ -1456,7 +1456,7 @@ fn spawn_deploy_task(
                 }
                 Err(e) => {
                     tracing::error!("Nixpacks build failed ({}): {}: {e}", triggered_by, config.name);
-                    record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &format!("Nixpacks build failed: {e}"), &triggered_by).await;
+                    record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, &format!("Nixpacks build failed: {e}"), &triggered_by).await;
                     if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
                         .bind(git_deploy_id).execute(&db).await
                     {
@@ -1473,7 +1473,7 @@ fn spawn_deploy_task(
                 Ok(result) => result.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
                 Err(e) => {
                     tracing::error!("Scheduled deploy build failed: {}: {e}", config.name);
-                    record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, &format!("Build failed: {e}"), &triggered_by).await;
+                    record_failed_history(&db, git_deploy_id, &commit_hash, commit_message_text, &format!("Build failed: {e}"), &triggered_by).await;
                     if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
                         .bind(git_deploy_id).execute(&db).await
                     {
@@ -2064,7 +2064,7 @@ pub async fn trigger_deploy_task(
 
     if configured_build_method == "compose" {
         let msg = "Docker Compose build method selected, but no compose file was found in the build context";
-        emit("compose", "Docker Compose file not found", "error", Some(msg.to_string()));
+        tracing::error!("{}: {}", config.name, msg);
         record_failed_history(&db, git_deploy_id, &commit_hash, &commit_message, msg, &triggered_by).await;
         if let Err(db_err) = sqlx::query("UPDATE git_deploys SET status = 'failed', updated_at = NOW() WHERE id = $1")
             .bind(git_deploy_id).execute(&db).await
@@ -2107,11 +2107,11 @@ pub async fn trigger_deploy_task(
         )
     };
     if build_method == "nixpacks" {
-        emit("detect", "Using Nixpacks", "done", None);
+        tracing::info!("Using Nixpacks for {}", config.name);
     } else if auto_generated {
-        emit("detect", "Auto-detected project type", "done", None);
+        tracing::info!("Auto-detected project type for {}", config.name);
     } else {
-        emit("detect", "Using existing Dockerfile", "done", None);
+        tracing::info!("Using existing Dockerfile for {}", config.name);
     }
 
     // Pre-build hook
