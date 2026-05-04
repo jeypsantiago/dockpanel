@@ -572,6 +572,87 @@ pub async fn prune_images(name: &str, keep: usize) -> Result<Vec<String>, String
     Ok(removed)
 }
 
+fn parse_dockerfile_exposed_port(contents: &str) -> Option<u16> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        let mut parts = trimmed.split_whitespace();
+        if !matches!(parts.next(), Some(token) if token.eq_ignore_ascii_case("EXPOSE")) {
+            continue;
+        }
+
+        for token in parts {
+            if let Some(port) = token.split('/').next().and_then(|p| p.parse::<u16>().ok()) {
+                return Some(port);
+            }
+        }
+    }
+
+    None
+}
+
+fn detect_project_port(context_dir: &std::path::Path) -> Option<u16> {
+    let dockerfile_path = context_dir.join("Dockerfile");
+    if dockerfile_path.exists() {
+        if let Ok(contents) = std::fs::read_to_string(&dockerfile_path) {
+            if let Some(port) = parse_dockerfile_exposed_port(&contents) {
+                return Some(port);
+            }
+        }
+    }
+
+    if context_dir.join("package.json").exists() {
+        let pkg = std::fs::read_to_string(context_dir.join("package.json")).unwrap_or_default().to_lowercase();
+        if pkg.contains("\"next\"") || pkg.contains("\"nuxt\"") {
+            Some(3000)
+        } else if pkg.contains("\"build\"") {
+            Some(80)
+        } else {
+            Some(3000)
+        }
+    } else if context_dir.join("requirements.txt").exists() {
+        let reqs = std::fs::read_to_string(context_dir.join("requirements.txt")).unwrap_or_default().to_lowercase();
+        if reqs.contains("django") {
+            Some(8000)
+        } else if reqs.contains("flask") {
+            Some(5000)
+        } else {
+            Some(8000)
+        }
+    } else if context_dir.join("go.mod").exists() {
+        let pocketbase_main = context_dir.join("examples").join("base").join("main.go");
+        if pocketbase_main.exists() {
+            Some(3000)
+        } else {
+            Some(8080)
+        }
+    } else if context_dir.join("Cargo.toml").exists() {
+        Some(8080)
+    } else if context_dir.join("composer.json").exists() {
+        Some(80)
+    } else if context_dir.join("Gemfile").exists() {
+        Some(3000)
+    } else if context_dir.join("index.html").exists() {
+        Some(80)
+    } else {
+        None
+    }
+}
+
+pub fn suggest_container_port(name: &str, dockerfile_path: &str, build_context: &str) -> Result<u16, String> {
+    let deploy_dir = format!("{GIT_BASE_DIR}/{name}");
+    let context_dir = if build_context == "." { deploy_dir.clone() } else { format!("{deploy_dir}/{build_context}") };
+    let context_dir = std::path::Path::new(&context_dir);
+    let df_path = context_dir.join(dockerfile_path);
+
+    if df_path.exists() {
+        let contents = std::fs::read_to_string(&df_path)
+            .map_err(|e| format!("Failed to read Dockerfile: {e}"))?;
+        return Ok(parse_dockerfile_exposed_port(&contents).or_else(|| detect_project_port(context_dir)).unwrap_or(3000));
+    }
+
+    Ok(detect_project_port(context_dir).unwrap_or(3000))
+}
+
 /// Auto-detect language and generate a Dockerfile if none exists.
 /// Returns the dockerfile path to use (either the existing one or "Dockerfile" for the generated one).
 pub fn auto_generate_dockerfile(name: &str, dockerfile_path: &str, build_context: &str) -> Result<String, String> {
@@ -1273,4 +1354,59 @@ pub async fn nixpacks_build(
 
     tracing::info!("Nixpacks build succeeded: {image_tag}");
     Ok((image_tag, full_output))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_name(prefix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        format!("{prefix}-{nanos}")
+    }
+
+    fn prepare_repo(name: &str) -> std::path::PathBuf {
+        let repo_dir = std::path::Path::new(GIT_BASE_DIR).join(name);
+        fs::create_dir_all(&repo_dir).expect("create temp repo");
+        repo_dir
+    }
+
+    #[test]
+    fn parses_explicit_expose_port() {
+        let dockerfile = "FROM nginx:alpine\nEXPOSE 85/tcp\n";
+        assert_eq!(parse_dockerfile_exposed_port(dockerfile), Some(85));
+    }
+
+    #[test]
+    fn suggests_static_frontend_port_80() {
+        let name = unique_name("static-port");
+        let repo_dir = prepare_repo(&name);
+        fs::write(repo_dir.join("index.html"), "<html></html>").expect("write index");
+
+        let port = suggest_container_port(&name, "Dockerfile", ".").expect("suggest port");
+        assert_eq!(port, 80);
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
+
+    #[test]
+    fn suggests_next_port_3000() {
+        let name = unique_name("next-port");
+        let repo_dir = prepare_repo(&name);
+        fs::write(
+            repo_dir.join("package.json"),
+            r#"{"name":"app","dependencies":{"next":"^14.0.0"}}"#,
+        )
+        .expect("write package.json");
+
+        let port = suggest_container_port(&name, "Dockerfile", ".").expect("suggest port");
+        assert_eq!(port, 3000);
+
+        fs::remove_dir_all(repo_dir).ok();
+    }
 }

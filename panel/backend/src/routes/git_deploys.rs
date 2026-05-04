@@ -136,6 +136,77 @@ pub struct UpdateRequest {
     pub preview_ttl_hours: Option<i32>,
 }
 
+#[derive(serde::Deserialize)]
+pub struct InspectPortRequest {
+    pub repo_url: String,
+    pub branch: Option<String>,
+    pub dockerfile: Option<String>,
+    pub build_context: Option<String>,
+}
+
+fn is_valid_repo_url(url: &str) -> bool {
+    if url.starts_with('-') {
+        return false;
+    }
+    if url.starts_with("file://") || url.starts_with("ext://") {
+        return false;
+    }
+    url.starts_with("https://")
+        || url.starts_with("http://")
+        || url.starts_with("ssh://")
+        || url.starts_with("git@")
+}
+
+async fn inspect_container_port(
+    agent: &AgentHandle,
+    repo_url: &str,
+    branch: &str,
+    dockerfile: &str,
+    build_context: &str,
+) -> Option<i32> {
+    if repo_url.trim().is_empty() || !is_valid_repo_url(repo_url) {
+        return None;
+    }
+
+    let probe_name = format!("probe-{}", Uuid::new_v4().simple());
+
+    if agent
+        .post(
+            "/git/clone",
+            Some(serde_json::json!({
+                "name": probe_name,
+                "repo_url": repo_url,
+                "branch": branch,
+                "key_path": null,
+            })),
+        )
+        .await
+        .is_err()
+    {
+        return None;
+    }
+
+    let detect = agent
+        .post(
+            "/git/auto-detect",
+            Some(serde_json::json!({
+                "name": probe_name,
+                "dockerfile": dockerfile,
+                "build_context": build_context,
+            })),
+        )
+        .await;
+
+    let _ = agent
+        .post("/git/cleanup", Some(serde_json::json!({ "name": probe_name })))
+        .await;
+
+    detect
+        .ok()
+        .and_then(|result| result.get("container_port").and_then(|v| v.as_i64()))
+        .map(|port| port as i32)
+}
+
 fn normalize_build_method(method: Option<&str>) -> Result<&'static str, ApiError> {
     match method.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
         "" | "auto" | "auto-detect" => Ok("auto"),
@@ -175,7 +246,7 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(server_id, _agent): ServerScope,
+    ServerScope(server_id, agent): ServerScope,
     Json(body): Json<CreateRequest>,
 ) -> Result<(StatusCode, Json<GitDeploy>), ApiError> {
     require_admin(&claims.role)?;
@@ -186,6 +257,14 @@ pub async fn create(
 
     if body.repo_url.trim().is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Repository URL is required"));
+    }
+    if !is_valid_repo_url(body.repo_url.trim()) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid repository URL"));
+    }
+    if let Some(port) = body.container_port {
+        if port <= 0 || port > 65535 {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid container port"));
+        }
     }
 
     // Auto-allocate host_port: find first gap in 7000-7999 (scoped to this server)
@@ -211,7 +290,20 @@ pub async fn create(
 
     let branch = body.branch.as_deref().unwrap_or("main");
     let dockerfile = body.dockerfile.as_deref().unwrap_or("Dockerfile");
-    let container_port = body.container_port.unwrap_or(3000);
+    let build_context = body.build_context.as_deref().unwrap_or(".");
+    let container_port = if let Some(port) = body.container_port {
+        port
+    } else {
+        inspect_container_port(
+            &agent,
+            body.repo_url.trim(),
+            branch,
+            dockerfile,
+            build_context,
+        )
+        .await
+        .unwrap_or(3000)
+    };
     let auto_deploy = body.auto_deploy.unwrap_or(false);
     let env_vars = body
         .env_vars
@@ -223,7 +315,6 @@ pub async fn create(
         .as_ref()
         .map(|e| serde_json::to_value(e).unwrap_or_default())
         .unwrap_or(serde_json::json!({}));
-    let build_context = body.build_context.as_deref().unwrap_or(".");
     let build_method = normalize_build_method(body.build_method.as_deref())?;
 
     let deploy_protected = body.deploy_protected.unwrap_or(false);
@@ -367,24 +458,22 @@ pub async fn get_one(
 pub async fn update(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
+    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateRequest>,
 ) -> Result<Json<GitDeploy>, ApiError> {
     require_admin(&claims.role)?;
 
-    // Verify ownership
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM git_deploys WHERE id = $1 AND user_id = $2",
+    // Verify ownership and capture the current config so we can probe defaults when needed.
+    let current: GitDeploy = sqlx::query_as(
+        "SELECT * FROM git_deploys WHERE id = $1 AND user_id = $2",
     )
     .bind(id)
     .bind(claims.sub)
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| internal_error("update git_deploys", e))?;
-
-    if existing.is_none() {
-        return Err(err(StatusCode::NOT_FOUND, "Git deploy not found"));
-    }
+    .map_err(|e| internal_error("update git_deploys", e))?
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "Git deploy not found"))?;
 
     if let Some(ref name) = body.name {
         if !is_valid_name(name) {
@@ -411,6 +500,27 @@ pub async fn update(
     let build_method = match body.build_method.as_deref() {
         Some(method) => Some(normalize_build_method(Some(method))?),
         None => None,
+    };
+
+    if let Some(ref repo_url) = body.repo_url {
+        if !repo_url.trim().is_empty() && !is_valid_repo_url(repo_url.trim()) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid repository URL"));
+        }
+    }
+    if let Some(port) = body.container_port {
+        if port <= 0 || port > 65535 {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid container port"));
+        }
+    }
+
+    let repo_url = body.repo_url.as_deref().unwrap_or(&current.repo_url);
+    let branch = body.branch.as_deref().unwrap_or(&current.branch);
+    let dockerfile = body.dockerfile.as_deref().unwrap_or(&current.dockerfile);
+    let build_context = body.build_context.as_deref().unwrap_or(&current.build_context);
+    let resolved_container_port = if let Some(port) = body.container_port {
+        Some(port)
+    } else {
+        inspect_container_port(&agent, repo_url, branch, dockerfile, build_context).await
     };
 
     let deploy: GitDeploy = sqlx::query_as(
@@ -443,7 +553,7 @@ pub async fn update(
     .bind(body.repo_url.as_deref())
     .bind(body.branch.as_deref())
     .bind(body.dockerfile.as_deref())
-    .bind(body.container_port)
+    .bind(resolved_container_port)
     .bind(body.domain.as_deref())
     .bind(env_vars)
     .bind(body.auto_deploy)
@@ -474,7 +584,33 @@ pub async fn update(
     Ok(Json(deploy))
 }
 
-/// DELETE /api/git-deploys/{id} — Remove a git deploy and its container.
+/// POST /api/git-deploys/inspect-port ? Probe a repo to suggest its container port.
+pub async fn inspect_port(
+    AuthUser(claims): AuthUser,
+    ServerScope(_server_id, agent): ServerScope,
+    Json(body): Json<InspectPortRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims.role)?;
+
+    if body.repo_url.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Repository URL is required"));
+    }
+    if !is_valid_repo_url(body.repo_url.trim()) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid repository URL"));
+    }
+
+    let branch = body.branch.as_deref().unwrap_or("main");
+    let dockerfile = body.dockerfile.as_deref().unwrap_or("Dockerfile");
+    let build_context = body.build_context.as_deref().unwrap_or(".");
+    let container_port = inspect_container_port(&agent, body.repo_url.trim(), branch, dockerfile, build_context)
+        .await
+        .unwrap_or(3000);
+
+    Ok(Json(serde_json::json!({
+        "container_port": container_port,
+    })))
+}
+
 pub async fn remove(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,

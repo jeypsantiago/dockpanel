@@ -617,6 +617,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/apps/{container_id}/activity-ping", post(docker_apps::activity_ping))
         // Git Deploy
         .route("/api/git-deploys", get(git_deploys::list).post(git_deploys::create))
+        .route("/api/git-deploys/inspect-port", post(git_deploys::inspect_port))
         .route("/api/git-deploys/{id}", get(git_deploys::get_one).put(git_deploys::update).delete(git_deploys::remove))
         .route("/api/git-deploys/{id}/deploy", post(git_deploys::deploy))
         .route("/api/git-deploys/{id}/rollback/{history_id}", post(git_deploys::rollback))

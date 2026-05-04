@@ -475,10 +475,14 @@ async fn auto_detect(Json(body): Json<AutoDetectRequest>) -> Result<Json<serde_j
         }
     };
 
+    let container_port = git_build::suggest_container_port(&body.name, &body.dockerfile, &body.build_context)
+        .unwrap_or(3000);
+
     Ok(Json(serde_json::json!({
         "dockerfile": dockerfile,
         "auto_generated": auto_generated,
         "build_method": build_method,
+        "container_port": container_port,
     })))
 }
 

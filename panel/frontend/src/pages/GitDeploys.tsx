@@ -115,7 +115,10 @@ export default function GitDeploys() {
   const [formRepo, setFormRepo] = useState("");
   const [formBranch, setFormBranch] = useState("main");
   const [formDockerfile, setFormDockerfile] = useState("Dockerfile");
-  const [formPort, setFormPort] = useState(3000);
+  const [formPort, setFormPort] = useState("");
+  const [portSuggestion, setPortSuggestion] = useState<number | null>(null);
+  const [portSuggestionLoading, setPortSuggestionLoading] = useState(false);
+  const [portManual, setPortManual] = useState(false);
   const [formDomain, setFormDomain] = useState("");
   const [formEnvVars, setFormEnvVars] = useState<{ key: string; value: string }[]>([]);
   const [formAutoDeploy, setFormAutoDeploy] = useState(false);
@@ -167,12 +170,55 @@ export default function GitDeploys() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected?.id]);
 
+  useEffect(() => {
+    if (!showModal || !formRepo.trim()) {
+      setPortSuggestion(null);
+      setPortSuggestionLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        setPortSuggestionLoading(true);
+        const result = await api.post<{ container_port: number }>("/git-deploys/inspect-port", {
+          repo_url: formRepo.trim(),
+          branch: formBranch || "main",
+          dockerfile: formDockerfile || "Dockerfile",
+          build_context: formBuildContext || ".",
+        });
+        if (!cancelled && result?.container_port) {
+          setPortSuggestion(result.container_port);
+          if (!editing && !portManual) {
+            setFormPort(String(result.container_port));
+          }
+        }
+      } catch {
+        if (!cancelled) {
+          setPortSuggestion(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setPortSuggestionLoading(false);
+        }
+      }
+    }, 500);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [showModal, formRepo, formBranch, formDockerfile, formBuildContext, editing, portManual]);
+
   const resetForm = () => {
     setFormName("");
     setFormRepo("");
     setFormBranch("main");
     setFormDockerfile("Dockerfile");
-    setFormPort(3000);
+    setFormPort("");
+    setPortSuggestion(null);
+    setPortSuggestionLoading(false);
+    setPortManual(false);
     setFormDomain("");
     setFormEnvVars([]);
     setFormAutoDeploy(false);
@@ -190,6 +236,7 @@ export default function GitDeploys() {
   const openCreate = () => {
     resetForm();
     setEditing(false);
+    setPortManual(false);
     setShowModal(true);
   };
 
@@ -199,7 +246,10 @@ export default function GitDeploys() {
     setFormRepo(selected.repo_url);
     setFormBranch(selected.branch);
     setFormDockerfile(selected.dockerfile);
-    setFormPort(selected.container_port);
+    setFormPort(String(selected.container_port));
+    setPortSuggestion(selected.container_port);
+    setPortSuggestionLoading(false);
+    setPortManual(true);
     setFormDomain(selected.domain || "");
     setFormEnvVars(
       Object.entries(selected.env_vars).map(([key, value]) => ({ key, value }))
@@ -237,7 +287,7 @@ export default function GitDeploys() {
       repo_url: formRepo,
       branch: formBranch || "main",
       dockerfile: formDockerfile || "Dockerfile",
-      container_port: formPort || 3000,
+      container_port: formPort.trim() ? Number(formPort) : null,
       domain: formDomain.trim() || null,
       env_vars: envVars,
       auto_deploy: formAutoDeploy,
@@ -939,11 +989,22 @@ export default function GitDeploys() {
                   <input
                     type="number"
                     value={formPort}
-                    onChange={(e) => setFormPort(parseInt(e.target.value) || 3000)}
+                    onChange={(e) => {
+                      setFormPort(e.target.value);
+                      setPortManual(true);
+                    }}
                     min={1}
                     max={65535}
+                    placeholder={portSuggestion ? String(portSuggestion) : "80"}
                     className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 outline-none"
                   />
+                  <p className="text-xs text-dark-300 mt-1">
+                    {portSuggestionLoading
+                      ? "Detecting the app port from the repository..."
+                      : portSuggestion
+                        ? `Detected port from repo: ${portSuggestion}. Leave this blank to auto-use the detected value.`
+                        : "Leave blank to auto-detect from the repository. The host port is assigned automatically."}
+                  </p>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-dark-100 mb-1">Domain (optional)</label>
