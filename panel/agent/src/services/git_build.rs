@@ -189,14 +189,20 @@ pub async fn build_image(
     } else {
         format!("{build_context}/{dockerfile_path}")
     };
+    let dockerfile_overlay =
+        write_frontend_dockerfile_overlay(&deploy_dir, &full_dockerfile, build_args)?;
+    let dockerfile_for_build = dockerfile_overlay
+        .as_ref()
+        .map(|(path, _)| path.clone())
+        .unwrap_or_else(|| full_dockerfile.clone());
     cmd_args.extend([
         "-t".into(), image_tag.clone(),
         "-t".into(), latest_tag.clone(),
-        "-f".into(), full_dockerfile,
+        "-f".into(), dockerfile_for_build,
         context_dir.clone(),
     ]);
 
-    let build = tokio::time::timeout(
+    let build_result = tokio::time::timeout(
         std::time::Duration::from_secs(600),
         safe_command("docker")
             .args(&cmd_args)
@@ -205,8 +211,12 @@ pub async fn build_image(
             .output(),
     )
     .await
-    .map_err(|_| "docker build timed out (600s)".to_string())?
-    .map_err(|e| format!("docker build failed: {e}"))?;
+    .map_err(|_| "docker build timed out (600s)".to_string())
+    .and_then(|result| result.map_err(|e| format!("docker build failed: {e}")));
+    if let Err(e) = restore_frontend_dockerfile_overlay(dockerfile_overlay) {
+        tracing::warn!("Failed to restore frontend Dockerfile overlay after Docker build: {e}");
+    }
+    let build = build_result?;
 
     let output = format!(
         "{}{}",
@@ -699,6 +709,72 @@ fn frontend_build_env_block(env_vars: &HashMap<String, String>) -> String {
         block.push_str(&format!("ARG {key}\nENV {key}=${key}\n"));
     }
     block
+}
+
+fn dockerfile_with_frontend_build_env(
+    dockerfile: &str,
+    build_args: &HashMap<String, String>,
+) -> Option<String> {
+    let env_block = frontend_build_env_block(build_args);
+    if env_block.is_empty() {
+        return None;
+    }
+
+    let mut output = String::new();
+    for line in dockerfile.lines() {
+        output.push_str(line);
+        output.push('\n');
+        if line.trim_start().to_ascii_lowercase().starts_with("from ") {
+            output.push_str(&env_block);
+        }
+    }
+    Some(output)
+}
+
+fn write_frontend_dockerfile_overlay(
+    deploy_dir: &str,
+    dockerfile_path: &str,
+    build_args: &HashMap<String, String>,
+) -> Result<Option<(String, std::path::PathBuf)>, String> {
+    let source_path = std::path::Path::new(deploy_dir).join(dockerfile_path);
+    let source = match std::fs::read_to_string(&source_path) {
+        Ok(source) => source,
+        Err(e) => return Err(format!("Failed to read Dockerfile for frontend env overlay: {e}")),
+    };
+    let Some(contents) = dockerfile_with_frontend_build_env(&source, build_args) else {
+        return Ok(None);
+    };
+
+    let source_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Dockerfile");
+    let overlay_name = format!(".dockpanel-{source_name}");
+    let overlay_path = source_path.with_file_name(&overlay_name);
+    let relative_overlay = std::path::Path::new(dockerfile_path)
+        .with_file_name(overlay_name)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    std::fs::write(&overlay_path, contents)
+        .map_err(|e| format!("Failed to write frontend Dockerfile overlay: {e}"))?;
+    Ok(Some((relative_overlay, overlay_path)))
+}
+
+fn restore_frontend_dockerfile_overlay(
+    overlay: Option<(String, std::path::PathBuf)>,
+) -> Result<(), String> {
+    let Some((_, path)) = overlay else {
+        return Ok(());
+    };
+
+    if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("Failed to remove frontend Dockerfile overlay: {e}"));
+        }
+    }
+
+    Ok(())
 }
 
 fn generated_node_dockerfile(pkg: &str, env_vars: &HashMap<String, String>) -> String {
@@ -1507,5 +1583,23 @@ mod tests {
         assert!(!dockerfile.contains("DATABASE_URL"));
         assert!(!dockerfile.contains("SECRET_KEY"));
         assert!(!dockerfile.contains("postgres://secret"));
+    }
+
+    #[test]
+    fn dockerfile_overlay_only_writes_public_build_args() {
+        let args = HashMap::from([
+            ("VITE_POCKETBASE_URL".to_string(), "https://api.example.com".to_string()),
+            ("PUBLIC_SITE_URL".to_string(), "https://app.example.com".to_string()),
+            ("POCKETBASE_SUPERUSER_PASSWORD".to_string(), "secret".to_string()),
+        ]);
+        let dockerfile = "FROM node:20-alpine AS builder\nRUN npm run build\nFROM nginx:alpine\n";
+
+        let overlay = dockerfile_with_frontend_build_env(dockerfile, &args).expect("dockerfile overlay");
+
+        assert!(overlay.contains("ARG VITE_POCKETBASE_URL\nENV VITE_POCKETBASE_URL=$VITE_POCKETBASE_URL\n"));
+        assert!(overlay.contains("ARG PUBLIC_SITE_URL\nENV PUBLIC_SITE_URL=$PUBLIC_SITE_URL\n"));
+        assert_eq!(overlay.matches("ARG VITE_POCKETBASE_URL").count(), 2);
+        assert!(!overlay.contains("POCKETBASE_SUPERUSER_PASSWORD"));
+        assert!(!overlay.contains("secret"));
     }
 }
