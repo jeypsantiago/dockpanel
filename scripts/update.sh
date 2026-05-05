@@ -411,6 +411,11 @@ if [ -d /etc/nginx/sites-enabled ]; then
             log "Stripped ipv6only=on from $site_conf for shared-socket compatibility"
             NGINX_NEEDS_RELOAD=1
         fi
+        if grep -qE '^[[:space:]]*listen[[:space:]]+[0-9.]+:443[[:space:]]+ssl;' "$site_conf"; then
+            sed -i -E 's|^([[:space:]]*)listen[[:space:]]+[0-9.]+:443[[:space:]]+ssl;|\1listen 443 ssl;|' "$site_conf"
+            log "Normalized explicit IPv4 HTTPS listener in $site_conf for server_name routing"
+            NGINX_NEEDS_RELOAD=1
+        fi
     done
 fi
 ensure_panel_https_fallback
