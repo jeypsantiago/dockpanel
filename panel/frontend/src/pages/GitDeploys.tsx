@@ -308,12 +308,20 @@ export default function GitDeploys() {
     formBuildArgs.forEach((arg) => {
       if (arg.key.trim()) buildArgs[arg.key.trim()] = arg.value;
     });
+    const parsedFormPort = formPort.trim() ? Number(formPort) : null;
+    const parsedEnvPort = envVars.PORT?.trim() ? Number(envVars.PORT.trim()) : null;
+    const envPort = parsedEnvPort && Number.isInteger(parsedEnvPort) && parsedEnvPort > 0 && parsedEnvPort <= 65535
+      ? parsedEnvPort
+      : null;
+    const containerPort = envPort && (!portManual || !parsedFormPort || (editing && selected && parsedFormPort === selected.container_port))
+      ? envPort
+      : parsedFormPort;
     const payload = {
       name: formName,
       repo_url: formRepo,
       branch: formBranch || "main",
       dockerfile: formDockerfile || "Dockerfile",
-      container_port: formPort.trim() ? Number(formPort) : null,
+      container_port: containerPort,
       domain: formDomain.trim() || null,
       env_vars: envVars,
       auto_deploy: formAutoDeploy,
