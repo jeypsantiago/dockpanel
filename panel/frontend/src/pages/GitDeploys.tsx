@@ -105,6 +105,7 @@ export default function GitDeploys() {
   const [showDeployKey, setShowDeployKey] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [showEnvPaste, setShowEnvPaste] = useState(false);
+  const [envPasteText, setEnvPasteText] = useState("");
   const [showLogs, setShowLogs] = useState(false);
   const [containerLogs, setContainerLogs] = useState("");
   const [previews, setPreviews] = useState<GitPreview[]>([]);
@@ -231,6 +232,25 @@ export default function GitDeploys() {
     setFormGithubToken("");
     setFormCron("");
     setFormProtected(false);
+    setFormPreviewTtl(24);
+    setShowEnvPaste(false);
+    setEnvPasteText("");
+  };
+
+  const parseEnvText = (text: string) => {
+    return text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"))
+      .map((line) => {
+        const eq = line.indexOf("=");
+        if (eq === -1) return { key: line.trim(), value: "" };
+        return {
+          key: line.substring(0, eq).trim(),
+          value: line.substring(eq + 1).trim().replace(/^["']|["']$/g, ""),
+        };
+      })
+      .filter((entry) => entry.key);
   };
 
   const openCreate = () => {
@@ -267,6 +287,8 @@ export default function GitDeploys() {
     setFormCron(selected.deploy_cron || "");
     setFormProtected(selected.deploy_protected || false);
     setFormPreviewTtl(selected.preview_ttl_hours ?? 24);
+    setShowEnvPaste(false);
+    setEnvPasteText("");
     setEditing(true);
     setShowModal(true);
   };
@@ -275,7 +297,10 @@ export default function GitDeploys() {
     setSubmitting(true);
     setMessage({ text: "", type: "" });
     const envVars: Record<string, string> = {};
-    formEnvVars.forEach((ev) => {
+    const envEntries = showEnvPaste && envPasteText.trim()
+      ? parseEnvText(envPasteText)
+      : formEnvVars;
+    envEntries.forEach((ev) => {
       if (ev.key.trim()) envVars[ev.key.trim()] = ev.value;
     });
     const buildArgs: Record<string, string> = {};
@@ -1051,20 +1076,21 @@ export default function GitDeploys() {
                     )}
                   </div>
                 </div>
+                <p className="text-xs text-dark-300 mb-2">
+                  Frontend build-time values need public prefixes: VITE_, NEXT_PUBLIC_, NUXT_PUBLIC_, or PUBLIC_.
+                </p>
                 {showEnvPaste ? (
                   <textarea
                     placeholder={"KEY=value\nDATABASE_URL=postgres://...\nSECRET_KEY=abc123"}
                     rows={6}
+                    value={envPasteText}
+                    onChange={(e) => setEnvPasteText(e.target.value)}
                     className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm font-mono focus:ring-2 focus:ring-accent-500 outline-none"
                     onBlur={(e) => {
-                      const lines = e.target.value.split("\n").filter((l) => l.trim() && !l.startsWith("#"));
-                      const parsed = lines.map((l) => {
-                        const eq = l.indexOf("=");
-                        if (eq === -1) return { key: l.trim(), value: "" };
-                        return { key: l.substring(0, eq).trim(), value: l.substring(eq + 1).trim().replace(/^["']|["']$/g, "") };
-                      }).filter((p) => p.key);
+                      const parsed = parseEnvText(e.target.value);
                       if (parsed.length > 0) {
                         setFormEnvVars(parsed);
+                        setEnvPasteText("");
                         setShowEnvPaste(false);
                       }
                     }}

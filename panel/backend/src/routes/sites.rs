@@ -25,6 +25,44 @@ use crate::services::notifications;
 use crate::services::security_hardening;
 use crate::AppState;
 
+pub(crate) fn normalize_domain_for_guard(domain: &str) -> Option<String> {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        None
+    } else {
+        Some(domain)
+    }
+}
+
+pub(crate) fn panel_domain_from_base_url(base_url: &str) -> Option<String> {
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        return None;
+    }
+
+    url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().and_then(normalize_domain_for_guard))
+        .or_else(|| {
+            if base_url.contains("://") {
+                return None;
+            }
+            url::Url::parse(&format!("http://{base_url}"))
+                .ok()
+                .and_then(|url| url.host_str().and_then(normalize_domain_for_guard))
+        })
+}
+
+pub(crate) fn domain_claims_panel_domain(domain: &str, base_url: &str) -> bool {
+    match (
+        normalize_domain_for_guard(domain),
+        panel_domain_from_base_url(base_url),
+    ) {
+        (Some(domain), Some(panel_domain)) => domain == panel_domain,
+        _ => false,
+    }
+}
+
 /// A single provisioning step event.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ProvisionStep {
@@ -146,11 +184,8 @@ pub async fn create(
         return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
     }
 
-    // Block reserved panel domains
-    let reserved = ["dockpanel.dev", "panel.example.com", "docs.dockpanel.dev"];
-    let domain_lower = body.domain.to_lowercase();
-    if reserved.iter().any(|r| domain_lower == *r || domain_lower.ends_with(&format!(".{r}"))) {
-        return Err(err(StatusCode::FORBIDDEN, "This domain is reserved and cannot be used"));
+    if domain_claims_panel_domain(&body.domain, &state.config.base_url) {
+        return Err(err(StatusCode::FORBIDDEN, "This domain is reserved for the panel"));
     }
 
     let runtime = body.runtime.as_deref().unwrap_or("static");
@@ -220,10 +255,11 @@ pub async fn create(
         }
     }
 
-    // Check domain uniqueness
+    // Check domain uniqueness within this server and across resource types.
     let existing: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM sites WHERE domain = $1")
+        sqlx::query_as("SELECT id FROM sites WHERE LOWER(domain) = LOWER($1) AND server_id = $2")
             .bind(&body.domain)
+            .bind(server_id)
             .fetch_optional(&state.db)
             .await
             .map_err(|e| internal_error("create sites", e))?;
@@ -234,7 +270,7 @@ pub async fn create(
 
     // Cross-table domain uniqueness: check git_deploys
     let git_conflict: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM git_deploys WHERE domain = $1 AND server_id = $2"
+        "SELECT id FROM git_deploys WHERE domain IS NOT NULL AND LOWER(domain) = LOWER($1) AND server_id = $2"
     )
     .bind(&body.domain)
     .bind(server_id)
@@ -1876,6 +1912,35 @@ pub async fn clone_site(
         return Err(err(StatusCode::BAD_REQUEST, "Invalid target domain format"));
     }
 
+    if domain_claims_panel_domain(target_domain, &state.config.base_url) {
+        return Err(err(StatusCode::FORBIDDEN, "This domain is reserved for the panel"));
+    }
+
+    let existing: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM sites WHERE LOWER(domain) = LOWER($1) AND server_id = $2")
+            .bind(target_domain)
+            .bind(server_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| internal_error("clone site", e))?;
+
+    if existing.is_some() {
+        return Err(err(StatusCode::CONFLICT, "A site with this domain already exists"));
+    }
+
+    let git_conflict: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM git_deploys WHERE domain IS NOT NULL AND LOWER(domain) = LOWER($1) AND server_id = $2"
+    )
+    .bind(target_domain)
+    .bind(server_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("clone site", e))?;
+
+    if git_conflict.is_some() {
+        return Err(err(StatusCode::CONFLICT, "Domain already in use by a git deployment"));
+    }
+
     // Get source site
     let source: Option<Site> = sqlx::query_as("SELECT * FROM sites WHERE id = $1 AND user_id = $2")
         .bind(id).bind(claims.sub).fetch_optional(&state.db).await
@@ -2104,7 +2169,7 @@ pub async fn set_env_vars(
 pub async fn rename_domain(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
+    ServerScope(server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -2133,10 +2198,16 @@ pub async fn rename_domain(
         return Err(err(StatusCode::BAD_REQUEST, "New domain is the same as current domain"));
     }
 
-    // Check uniqueness
+    if domain_claims_panel_domain(&new_domain, &state.config.base_url) {
+        return Err(err(StatusCode::FORBIDDEN, "This domain is reserved for the panel"));
+    }
+
+    // Check uniqueness within this server and across resource types.
     let existing: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM sites WHERE domain = $1")
+        sqlx::query_as("SELECT id FROM sites WHERE LOWER(domain) = LOWER($1) AND server_id = $2 AND id != $3")
             .bind(&new_domain)
+            .bind(server_id)
+            .bind(id)
             .fetch_optional(&state.db)
             .await
             .map_err(|e| internal_error("rename domain", e))?;
@@ -2146,9 +2217,10 @@ pub async fn rename_domain(
     }
 
     let git_conflict: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM git_deploys WHERE domain = $1"
+        "SELECT id FROM git_deploys WHERE domain IS NOT NULL AND LOWER(domain) = LOWER($1) AND server_id = $2"
     )
     .bind(&new_domain)
+    .bind(server_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| internal_error("rename domain", e))?;
@@ -2904,4 +2976,44 @@ pub async fn toggle_bot_protection(
         "ok": true,
         "bot_protection": mode,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_domain_for_guardrails() {
+        assert_eq!(
+            normalize_domain_for_guard(" Panel.Example.COM. "),
+            Some("panel.example.com".to_string())
+        );
+        assert_eq!(normalize_domain_for_guard("   "), None);
+    }
+
+    #[test]
+    fn extracts_panel_domain_from_base_url() {
+        assert_eq!(
+            panel_domain_from_base_url("https://Panel.Example.com:8443/app"),
+            Some("panel.example.com".to_string())
+        );
+        assert_eq!(
+            panel_domain_from_base_url("panel.example.com:8443"),
+            Some("panel.example.com".to_string())
+        );
+        assert_eq!(panel_domain_from_base_url(""), None);
+    }
+
+    #[test]
+    fn detects_exact_panel_domain_claims_only() {
+        assert!(domain_claims_panel_domain(
+            "PANEL.EXAMPLE.COM.",
+            "https://panel.example.com"
+        ));
+        assert!(!domain_claims_panel_domain(
+            "app.panel.example.com",
+            "https://panel.example.com"
+        ));
+        assert!(!domain_claims_panel_domain("panel.example.com", ""));
+    }
 }

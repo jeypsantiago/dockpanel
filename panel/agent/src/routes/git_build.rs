@@ -98,7 +98,7 @@ struct DeployRequest {
     image_tag: String,
     container_port: u16,
     host_port: u16,
-    #[serde(default)]
+    #[serde(default, alias = "env_vars")]
     env: HashMap<String, String>,
     domain: Option<String>,
     memory_mb: Option<u64>,
@@ -448,6 +448,8 @@ struct AutoDetectRequest {
     dockerfile: String,
     #[serde(default = "default_context")]
     build_context: String,
+    #[serde(default)]
+    env_vars: HashMap<String, String>,
 }
 
 /// POST /git/auto-detect — Auto-detect language and generate Dockerfile if missing.
@@ -469,7 +471,12 @@ async fn auto_detect(Json(body): Json<AutoDetectRequest>) -> Result<Json<serde_j
             "dockerfile".to_string(),
         )
     } else {
-        match git_build::auto_generate_dockerfile(&body.name, &body.dockerfile, &body.build_context) {
+        match git_build::auto_generate_dockerfile(
+            &body.name,
+            &body.dockerfile,
+            &body.build_context,
+            &body.env_vars,
+        ) {
             Ok(dockerfile) => (dockerfile, true, "dockerfile".to_string()),
             Err(_) => (body.dockerfile.clone(), false, "nixpacks".to_string()),
         }

@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::auth::{AuthUser, ServerScope};
 use crate::error::{internal_error, err, agent_error, require_admin, ApiError};
-use crate::routes::is_valid_name;
-use crate::routes::sites::ProvisionStep;
+use crate::routes::{is_valid_domain, is_valid_name};
+use crate::routes::sites::{domain_claims_panel_domain, normalize_domain_for_guard, ProvisionStep};
 use crate::services::activity;
 use crate::services::agent::AgentHandle;
 use crate::services::notifications;
@@ -217,6 +217,37 @@ fn normalize_build_method(method: Option<&str>) -> Result<&'static str, ApiError
     }
 }
 
+fn is_public_frontend_env_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && (key.starts_with("VITE_")
+            || key.starts_with("NEXT_PUBLIC_")
+            || key.starts_with("NUXT_PUBLIC_")
+            || key.starts_with("PUBLIC_"))
+}
+
+fn build_args_with_public_env(
+    build_args: &serde_json::Value,
+    env_vars: &serde_json::Value,
+) -> serde_json::Value {
+    let mut merged = build_args.as_object().cloned().unwrap_or_default();
+
+    if let Some(env) = env_vars.as_object() {
+        for (key, value) in env {
+            if !is_public_frontend_env_key(key) || merged.contains_key(key) {
+                continue;
+            }
+            if let Some(value) = value.as_str() {
+                merged.insert(key.clone(), serde_json::Value::String(value.to_string()));
+            }
+        }
+    }
+
+    serde_json::Value::Object(merged)
+}
+
 /// GET /api/git-deploys — List all git deploys for the current user.
 pub async fn list(
     State(state): State<AppState>,
@@ -340,34 +371,44 @@ pub async fn create(
         return Err(err(StatusCode::BAD_REQUEST, "build_context must not contain '..' or start with '/'"));
     }
 
-    // Cross-table domain uniqueness: check sites table
-    if let Some(ref domain) = body.domain {
-        if !domain.is_empty() {
-            let site_conflict: Option<(Uuid,)> = sqlx::query_as(
-                "SELECT id FROM sites WHERE domain = $1 AND server_id = $2"
-            )
-            .bind(domain)
-            .bind(server_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("create git_deploys", e))?;
+    let requested_domain = body
+        .domain
+        .as_deref()
+        .and_then(normalize_domain_for_guard);
 
-            if site_conflict.is_some() {
-                return Err(err(StatusCode::CONFLICT, "Domain already in use by a site"));
-            }
+    // Cross-table domain uniqueness: check sites and git_deploys on this server.
+    if let Some(ref domain) = requested_domain {
+        if !is_valid_domain(domain) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+        }
+        if domain_claims_panel_domain(domain, &state.config.base_url) {
+            return Err(err(StatusCode::FORBIDDEN, "This domain is reserved for the panel"));
+        }
 
-            let git_conflict: Option<(Uuid,)> = sqlx::query_as(
-                "SELECT id FROM git_deploys WHERE domain = $1 AND server_id = $2"
-            )
-            .bind(domain)
-            .bind(server_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("create git_deploys", e))?;
+        let site_conflict: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM sites WHERE LOWER(domain) = LOWER($1) AND server_id = $2"
+        )
+        .bind(domain)
+        .bind(server_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("create git_deploys", e))?;
 
-            if git_conflict.is_some() {
-                return Err(err(StatusCode::CONFLICT, "Domain already in use by another git deployment"));
-            }
+        if site_conflict.is_some() {
+            return Err(err(StatusCode::CONFLICT, "Domain already in use by a site"));
+        }
+
+        let git_conflict: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM git_deploys WHERE domain IS NOT NULL AND LOWER(domain) = LOWER($1) AND server_id = $2"
+        )
+        .bind(domain)
+        .bind(server_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("create git_deploys", e))?;
+
+        if git_conflict.is_some() {
+            return Err(err(StatusCode::CONFLICT, "Domain already in use by another git deployment"));
         }
     }
 
@@ -384,7 +425,7 @@ pub async fn create(
     .bind(dockerfile)
     .bind(container_port)
     .bind(host_port)
-    .bind(&body.domain)
+    .bind(&requested_domain)
     .bind(&env_vars)
     .bind(auto_deploy)
     .bind(&webhook_secret)
@@ -458,7 +499,7 @@ pub async fn get_one(
 pub async fn update(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
-    ServerScope(_server_id, agent): ServerScope,
+    ServerScope(server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateRequest>,
 ) -> Result<Json<GitDeploy>, ApiError> {
@@ -513,6 +554,51 @@ pub async fn update(
         }
     }
 
+    if current.server_id != server_id {
+        return Err(err(StatusCode::NOT_FOUND, "Git deploy not found"));
+    }
+
+    let requested_domain = body
+        .domain
+        .as_deref()
+        .and_then(normalize_domain_for_guard);
+
+    if let Some(ref domain) = requested_domain {
+        if !is_valid_domain(domain) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+        }
+        if domain_claims_panel_domain(domain, &state.config.base_url) {
+            return Err(err(StatusCode::FORBIDDEN, "This domain is reserved for the panel"));
+        }
+
+        let site_conflict: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM sites WHERE LOWER(domain) = LOWER($1) AND server_id = $2"
+        )
+        .bind(domain)
+        .bind(server_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("update git_deploys", e))?;
+
+        if site_conflict.is_some() {
+            return Err(err(StatusCode::CONFLICT, "Domain already in use by a site"));
+        }
+
+        let git_conflict: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM git_deploys WHERE domain IS NOT NULL AND LOWER(domain) = LOWER($1) AND server_id = $2 AND id != $3"
+        )
+        .bind(domain)
+        .bind(server_id)
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("update git_deploys", e))?;
+
+        if git_conflict.is_some() {
+            return Err(err(StatusCode::CONFLICT, "Domain already in use by another git deployment"));
+        }
+    }
+
     let repo_url = body.repo_url.as_deref().unwrap_or(&current.repo_url);
     let branch = body.branch.as_deref().unwrap_or(&current.branch);
     let dockerfile = body.dockerfile.as_deref().unwrap_or(&current.dockerfile);
@@ -554,7 +640,7 @@ pub async fn update(
     .bind(body.branch.as_deref())
     .bind(body.dockerfile.as_deref())
     .bind(resolved_container_port)
-    .bind(body.domain.as_deref())
+    .bind(requested_domain.as_deref())
     .bind(env_vars)
     .bind(body.auto_deploy)
     .bind(body.memory_mb)
@@ -910,7 +996,7 @@ pub async fn rollback(
             "image_tag": rollback_image,
             "container_port": config.container_port,
             "host_port": config.host_port,
-            "env_vars": config.env_vars,
+            "env": &config.env_vars,
         });
         if let Some(ref domain) = config.domain {
             deploy_body["domain"] = serde_json::json!(domain);
@@ -1536,6 +1622,7 @@ fn spawn_deploy_task(
         } else {
             let detect_result = match agent.post("/git/auto-detect", Some(serde_json::json!({
                 "name": config.name, "dockerfile": config.dockerfile, "build_context": config.build_context,
+                "env_vars": &config.env_vars,
             }))).await {
                 Ok(result) => result,
                 Err(e) => {
@@ -1584,7 +1671,7 @@ fn spawn_deploy_task(
                 "name": config.name,
                 "commit_hash": commit_hash,
                 "build_context": &config.build_context,
-                "env_vars": config.env_vars,
+                "env_vars": &config.env_vars,
             })), 660).await {
                 Ok(result) => {
                     tracing::info!("Nixpacks build succeeded for {}", config.name);
@@ -1604,7 +1691,8 @@ fn spawn_deploy_task(
         } else {
             match agent.post_long("/git/build", Some(serde_json::json!({
                 "name": config.name, "dockerfile": detected_dockerfile, "commit_hash": commit_hash,
-                "build_args": config.build_args, "build_context": config.build_context,
+                "build_args": build_args_with_public_env(&config.build_args, &config.env_vars),
+                "build_context": config.build_context,
             })), 660).await {
                 Ok(result) => result.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
                 Err(e) => {
@@ -1635,7 +1723,7 @@ fn spawn_deploy_task(
             "image_tag": image_tag,
             "container_port": config.container_port,
             "host_port": config.host_port,
-            "env_vars": config.env_vars,
+            "env": &config.env_vars,
         });
         if let Some(ref domain) = config.domain {
             deploy_body["domain"] = serde_json::json!(domain);
@@ -2218,6 +2306,7 @@ pub async fn trigger_deploy_task(
     } else {
         let detect_result = match agent.post("/git/auto-detect", Some(serde_json::json!({
             "name": config.name, "dockerfile": config.dockerfile, "build_context": config.build_context,
+            "env_vars": &config.env_vars,
         }))).await {
             Ok(result) => result,
             Err(e) => {
@@ -2265,7 +2354,7 @@ pub async fn trigger_deploy_task(
             "name": config.name,
             "commit_hash": commit_hash,
             "build_context": &config.build_context,
-            "env_vars": config.env_vars,
+            "env_vars": &config.env_vars,
         })), 660).await {
             Ok(result) => {
                 let tag = result.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
@@ -2286,7 +2375,8 @@ pub async fn trigger_deploy_task(
     } else {
         match agent.post_long("/git/build", Some(serde_json::json!({
             "name": config.name, "dockerfile": detected_dockerfile, "commit_hash": commit_hash,
-            "build_args": config.build_args, "build_context": config.build_context,
+            "build_args": build_args_with_public_env(&config.build_args, &config.env_vars),
+            "build_context": config.build_context,
         })), 660).await {
             Ok(r) => r.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
             Err(e) => {
@@ -2311,7 +2401,7 @@ pub async fn trigger_deploy_task(
     let mut deploy_body = serde_json::json!({
         "name": config.name, "image_tag": image_tag,
         "container_port": config.container_port, "host_port": config.host_port,
-        "env_vars": config.env_vars,
+        "env": &config.env_vars,
     });
     if let Some(ref domain) = config.domain { deploy_body["domain"] = serde_json::json!(domain); }
     if let Some(ref ssl) = config.ssl_email { deploy_body["ssl_email"] = serde_json::json!(ssl); }
@@ -2525,6 +2615,7 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
                 "name": preview_name,
                 "dockerfile": dockerfile,
                 "build_context": build_context,
+                "env_vars": &env_vars,
             }))).await {
                 Ok(result) => (
                     result.get("build_method").and_then(|v| v.as_str()).unwrap_or("nixpacks").to_string(),
@@ -2548,7 +2639,7 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
                 "name": preview_name,
                 "commit_hash": commit_hash,
                 "build_context": build_context,
-                "env_vars": env_vars,
+                "env_vars": &env_vars,
             })), 660).await {
                 Ok(r) => r.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
                 Err(e) => {
@@ -2566,7 +2657,7 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
                 "name": preview_name,
                 "dockerfile": dockerfile,
                 "commit_hash": commit_hash,
-                "build_args": build_args,
+                "build_args": build_args_with_public_env(&build_args, &env_vars),
                 "build_context": build_context,
             })), 660).await {
                 Ok(r) => r.get("image_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
@@ -2588,7 +2679,7 @@ async fn handle_preview_deploy(state: &AppState, agent: &AgentHandle, config: &G
             "image_tag": image_tag,
             "container_port": container_port,
             "host_port": port,
-            "env_vars": env_vars,
+            "env": &env_vars,
         });
         if let Some(ref pd) = preview_domain {
             deploy_body["domain"] = serde_json::json!(pd);
@@ -2890,4 +2981,42 @@ pub async fn reject_deploy(
         "status": "rejected",
         "message": "Deploy request rejected",
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_public_frontend_env_keys() {
+        assert!(is_public_frontend_env_key("VITE_POCKETBASE_URL"));
+        assert!(is_public_frontend_env_key("NEXT_PUBLIC_API_URL"));
+        assert!(is_public_frontend_env_key("NUXT_PUBLIC_API_URL"));
+        assert!(is_public_frontend_env_key("PUBLIC_API_URL"));
+
+        assert!(!is_public_frontend_env_key("DATABASE_URL"));
+        assert!(!is_public_frontend_env_key("SECRET_KEY"));
+        assert!(!is_public_frontend_env_key("vite_api_url"));
+        assert!(!is_public_frontend_env_key("VITE-API-URL"));
+    }
+
+    #[test]
+    fn merges_public_frontend_env_into_build_args_without_overwriting() {
+        let build_args = serde_json::json!({
+            "VITE_POCKETBASE_URL": "https://override.example.com",
+            "EXISTING": "kept"
+        });
+        let env_vars = serde_json::json!({
+            "VITE_POCKETBASE_URL": "https://api.example.com",
+            "NEXT_PUBLIC_API_URL": "https://next.example.com",
+            "DATABASE_URL": "postgres://secret"
+        });
+
+        let merged = build_args_with_public_env(&build_args, &env_vars);
+
+        assert_eq!(merged["VITE_POCKETBASE_URL"], "https://override.example.com");
+        assert_eq!(merged["NEXT_PUBLIC_API_URL"], "https://next.example.com");
+        assert_eq!(merged["EXISTING"], "kept");
+        assert!(merged.get("DATABASE_URL").is_none());
+    }
 }

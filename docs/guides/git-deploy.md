@@ -25,6 +25,10 @@ Git Deploy lets you push code to a Git repository and have DockPanel automatical
 
 DockPanel will clone the repository, detect the build method, build a Docker image, and start the container.
 
+### Frontend Environment Variables
+
+Frontend values needed during build must use your framework's public prefix, such as `VITE_`, `NEXT_PUBLIC_`, `NUXT_PUBLIC_`, or `PUBLIC_`. Secrets like `DATABASE_URL` stay runtime-only and are not passed into generated Dockerfile build args.
+
 ## Webhook Setup
 
 Webhooks trigger automatic deploys when you push to your repository.

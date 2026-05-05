@@ -95,6 +95,16 @@ async fn put_site(
     Path(domain): Path<String>,
     Json(config): Json<SiteConfig>,
 ) -> Result<Json<NginxResponse>, (StatusCode, Json<NginxResponse>)> {
+    if domain.eq_ignore_ascii_case("dockpanel-panel") {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(NginxResponse {
+                success: false,
+                message: "dockpanel-panel is reserved for the DockPanel panel vhost".into(),
+            }),
+        ));
+    }
+
     // Validate domain format
     if !is_valid_domain(&domain) {
         return Err((
@@ -102,6 +112,18 @@ async fn put_site(
             Json(NginxResponse {
                 success: false,
                 message: "Invalid domain format".into(),
+            }),
+        ));
+    }
+
+    if let Some(panel_domain) = services::nginx::reserved_panel_domain_match(&domain) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(NginxResponse {
+                success: false,
+                message: format!(
+                    "{domain} is reserved for the DockPanel panel vhost ({panel_domain})"
+                ),
             }),
         ));
     }
@@ -525,14 +547,40 @@ async fn rename_site(
         })));
     }
 
-    let new_domain = body.get("new_domain")
+    let new_domain = body
+        .get("new_domain")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    if new_domain.eq_ignore_ascii_case("dockpanel-panel") {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(NginxResponse {
+                success: false,
+                message: "dockpanel-panel is reserved for the DockPanel panel vhost".into(),
+            }),
+        ));
+    }
+
     if !is_valid_domain(new_domain) {
-        return Err((StatusCode::BAD_REQUEST, Json(NginxResponse {
-            success: false, message: "Invalid new domain format".into(),
-        })));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(NginxResponse {
+                success: false,
+                message: "Invalid new domain format".into(),
+            }),
+        ));
+    }
+    if let Some(panel_domain) = services::nginx::reserved_panel_domain_match(new_domain) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(NginxResponse {
+                success: false,
+                message: format!(
+                    "{new_domain} is reserved for the DockPanel panel vhost ({panel_domain})"
+                ),
+            }),
+        ));
     }
 
     let old_conf = format!("/etc/nginx/sites-enabled/{old_domain}.conf");
@@ -1078,6 +1126,15 @@ async fn add_alias(
     }
     if !super::is_valid_domain(&body.alias) {
         return Err(api_err(StatusCode::BAD_REQUEST, "Invalid alias domain format"));
+    }
+    if let Some(panel_domain) = services::nginx::reserved_panel_domain_match(&body.alias) {
+        return Err(api_err(
+            StatusCode::CONFLICT,
+            &format!(
+                "{} is reserved for the DockPanel panel vhost ({panel_domain})",
+                body.alias
+            ),
+        ));
     }
 
     let site_conf = format!("/etc/nginx/sites-enabled/{}.conf", body.domain);

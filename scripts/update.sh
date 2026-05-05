@@ -256,40 +256,96 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
     done
 fi
 
-# ── Migrate panel nginx config to bind IPv6 (fixes site-vhost dual-stack hijack) ──
-# v2.8.3: agent site templates declare `listen [::]:443 ssl;` (dual-stack), but
-# pre-v2.8.3 setup.sh bound the panel to IPv4 only. The first SSL site to be
-# provisioned then became the de-facto default for IPv6 traffic — WordPress
-# would 301 panel-domain requests to its canonical home_url. Fix: ensure the
-# panel vhost also has `listen [::]:80;` and `listen [::]:443 ssl;`. Plain
-# (no `ipv6only=on`) so the panel listens dual-stack on the same socket as
-# every site, and nginx routes by server_name across the shared listener.
-# Strip any `ipv6only=on` certbot may have added on prior installs to keep
-# the listener options consistent across vhosts (otherwise nginx errors with
-# "duplicate listen options" when sites add their own [::]:443 ssl block).
+normalize_domain_value() {
+    local value="$1"
+    value=$(printf '%s' "$value" | tr -d '"' | tr -d "'" | sed -E 's|^[[:space:]]+||; s|[[:space:]]+$||')
+    value=$(printf '%s' "$value" | sed -E 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||; s|^[^@/]+@||; s|[/?#].*$||; s|:[0-9]+$||; s|\.$||' | tr '[:upper:]' '[:lower:]')
+    case "$value" in
+        ""|_*|localhost|*[\[\]*_]*|*..*|.*|*.) return 1 ;;
+    esac
+    printf '%s' "$value" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' || return 1
+    printf '%s\n' "$value"
+}
+
+detect_panel_domain() {
+    local candidate conf
+    if [ -f /etc/dockpanel/api.env ]; then
+        candidate=$(grep '^BASE_URL=' /etc/dockpanel/api.env 2>/dev/null | tail -1 | cut -d= -f2- || true)
+        normalize_domain_value "$candidate" 2>/dev/null && return 0
+    fi
+    for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
+        [ -f "$conf" ] || continue
+        candidate=$(awk '/^[[:space:]]*server_name[[:space:]]+/ { for (i=2; i<=NF; i++) { gsub(/;/, "", $i); print $i; exit } }' "$conf" 2>/dev/null || true)
+        normalize_domain_value "$candidate" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+repair_panel_domain_site_vhosts() {
+    local panel_domain site_conf base safe_match disabled_path site_name
+    panel_domain=$(detect_panel_domain 2>/dev/null || true)
+    [ -n "$panel_domain" ] || return 0
+    [ -d /etc/nginx/sites-enabled ] || return 0
+
+    for site_conf in /etc/nginx/sites-enabled/*.conf; do
+        [ -f "$site_conf" ] || continue
+        base=$(basename "$site_conf")
+        [ "$base" = "dockpanel-panel.conf" ] && continue
+        if ! awk -v d="$panel_domain" '/^[[:space:]]*server_name[[:space:]]+/ { for (i=2; i<=NF; i++) { gsub(/;/, "", $i); if (tolower($i) == d) found=1 } } END { exit(found ? 0 : 1) }' "$site_conf"; then
+            continue
+        fi
+
+        safe_match=0
+        site_name="${base%.conf}"
+        if grep -qE "root[[:space:]]+/var/www/${site_name}(/|;)" "$site_conf" 2>/dev/null \
+            || grep -qE "access_log[[:space:]]+/var/log/nginx/${site_name}\.access\.log;" "$site_conf" 2>/dev/null \
+            || grep -qE "error_log[[:space:]]+/var/log/nginx/${site_name}\.error\.log;" "$site_conf" 2>/dev/null; then
+            safe_match=1
+        fi
+
+        if [ "$safe_match" = "1" ]; then
+            mkdir -p /etc/nginx/sites-disabled
+            disabled_path="/etc/nginx/sites-disabled/${base}.panel-domain-conflict.$(date +%Y%m%d%H%M%S)"
+            mv "$site_conf" "$disabled_path"
+            warn "Disabled DockPanel site vhost $site_conf because it claimed panel domain $panel_domain"
+            NGINX_NEEDS_RELOAD=1
+        else
+            warn "Detected site vhost $site_conf claiming panel domain $panel_domain; left untouched because it was not safe to identify"
+        fi
+    done
+}
+
+# ── Migrate panel nginx config/listeners and repair panel-domain site collisions ──
 NGINX_NEEDS_RELOAD=0
-for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
-    [ -f "$conf" ] || continue
-    if ! grep -qE 'listen \[::\]:80' "$conf"; then
-        sed -i -E '0,/^([[:space:]]*)listen ([^;]*):80;[[:space:]]*$/{s||\1listen \2:80;\n\1listen [::]:80;|}' "$conf"
-        sed -i -E '0,/^([[:space:]]*)listen 80;[[:space:]]*$/{s||\1listen 80;\n\1listen [::]:80;|}' "$conf"
-        log "Added IPv6 :80 listen to $conf"
-        NGINX_NEEDS_RELOAD=1
-    fi
-    if grep -qE 'listen [^;]*:443 ssl' "$conf" && ! grep -qE 'listen \[::\]:443' "$conf"; then
-        sed -i -E '0,/^([[:space:]]*)listen ([^;]*):443 ssl;[[:space:]]*$/{s||\1listen \2:443 ssl;\n\1listen [::]:443 ssl;|}' "$conf"
-        log "Added IPv6 :443 ssl listen to $conf"
-        NGINX_NEEDS_RELOAD=1
-    fi
-    # Strip `ipv6only=on` from panel listens if previously added — site vhosts
-    # use plain `[::]:443 ssl;` and nginx rejects mixing the two on a shared socket.
-    if grep -qE 'listen \[::\]:(80|443 ssl) ipv6only=on' "$conf"; then
-        sed -i -E 's|^([[:space:]]*)listen \[::\]:80 ipv6only=on;|\1listen [::]:80;|' "$conf"
-        sed -i -E 's|^([[:space:]]*)listen \[::\]:443 ssl ipv6only=on;|\1listen [::]:443 ssl;|' "$conf"
-        log "Stripped ipv6only=on from $conf for shared-socket compatibility"
-        NGINX_NEEDS_RELOAD=1
-    fi
-done
+PANEL_DOMAIN_FOR_NGINX=$(detect_panel_domain 2>/dev/null || true)
+if [ -n "$PANEL_DOMAIN_FOR_NGINX" ]; then
+    for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
+        [ -f "$conf" ] || continue
+        if grep -q 'ipv6only=on' "$conf"; then
+            sed -i -E 's/[[:space:]]+ipv6only=on//g' "$conf"
+            log "Stripped ipv6only=on from $conf for shared-socket compatibility"
+            NGINX_NEEDS_RELOAD=1
+        fi
+        if ! grep -qE '^[[:space:]]*listen[[:space:]]+\[::\]:80' "$conf"; then
+            sed -i -E '0,/^([[:space:]]*)listen[[:space:]]+([^;]*80);[[:space:]]*$/{s||\1listen \2;\n\1listen [::]:80;|}' "$conf"
+            sed -i -E '0,/^([[:space:]]*)listen 80;[[:space:]]*$/{s||\1listen 80;\n\1listen [::]:80;|}' "$conf"
+            log "Added IPv6 :80 listen to $conf"
+            NGINX_NEEDS_RELOAD=1
+        fi
+        if grep -qE '^[[:space:]]*listen[[:space:]]+.*443[[:space:]]+ssl' "$conf"; then
+            if ! grep -qE '^[[:space:]]*listen[[:space:]]+([^[][^;]*:)?443[[:space:]]+ssl;' "$conf"; then
+                sed -i -E '0,/^([[:space:]]*)listen[[:space:]]+\[::\]:443[[:space:]]+ssl;[[:space:]]*$/{s||\1listen 443 ssl;\n\1listen [::]:443 ssl;|}' "$conf"
+                log "Added IPv4 :443 ssl listen to $conf"
+                NGINX_NEEDS_RELOAD=1
+            fi
+            if ! grep -qE '^[[:space:]]*listen[[:space:]]+\[::\]:443[[:space:]]+ssl;' "$conf"; then
+                sed -i -E '0,/^([[:space:]]*)listen[[:space:]]+([^;]*443[[:space:]]+ssl);[[:space:]]*$/{s||\1listen \2;\n\1listen [::]:443 ssl;|}' "$conf"
+                log "Added IPv6 :443 ssl listen to $conf"
+                NGINX_NEEDS_RELOAD=1
+            fi
+        fi
+    done
+fi
 # Strip `ipv6only=on` from site vhosts left over from v2.8.3.
 # v2.8.3 baked the option into agent templates AND added it via update.sh;
 # v2.8.4 reverted the template but dropped this site-vhost cleanup. Result:
@@ -311,6 +367,7 @@ if [ -d /etc/nginx/sites-enabled ]; then
         fi
     done
 fi
+repair_panel_domain_site_vhosts
 if [ "$NGINX_NEEDS_RELOAD" = "1" ]; then
     if nginx -t > /dev/null 2>&1; then
         nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen migration"

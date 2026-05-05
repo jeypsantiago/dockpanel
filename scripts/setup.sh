@@ -663,6 +663,99 @@ EOF
 }
 
 # ── Nginx for Panel ──────────────────────────────────────────────────────
+normalize_domain_value() {
+    local value="$1"
+    value=$(printf '%s' "$value" | tr -d '"' | tr -d "'" | sed -E 's|^[[:space:]]+||; s|[[:space:]]+$||')
+    value=$(printf '%s' "$value" | sed -E 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||; s|^[^@/]+@||; s|[/?#].*$||; s|:[0-9]+$||; s|\.$||' | tr '[:upper:]' '[:lower:]')
+    case "$value" in
+        ""|_*|localhost|*[\[\]*_]*|*..*|.*|*.) return 1 ;;
+    esac
+    printf '%s' "$value" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' || return 1
+    printf '%s\n' "$value"
+}
+
+detect_panel_domain() {
+    local candidate conf
+    if [ -f "$CONFIG_DIR/api.env" ]; then
+        candidate=$(grep '^BASE_URL=' "$CONFIG_DIR/api.env" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+        normalize_domain_value "$candidate" 2>/dev/null && return 0
+    fi
+    for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
+        [ -f "$conf" ] || continue
+        candidate=$(awk '/^[[:space:]]*server_name[[:space:]]+/ { for (i=2; i<=NF; i++) { gsub(/;/, "", $i); print $i; exit } }' "$conf" 2>/dev/null || true)
+        normalize_domain_value "$candidate" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+normalize_panel_nginx_listens() {
+    local conf changed=0
+    for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
+        [ -f "$conf" ] || continue
+        if grep -q 'ipv6only=on' "$conf"; then
+            sed -i -E 's/[[:space:]]+ipv6only=on//g' "$conf"
+            changed=1
+            log "Stripped ipv6only=on from $conf"
+        fi
+        if ! grep -qE '^[[:space:]]*listen[[:space:]]+\[::\]:80' "$conf"; then
+            sed -i -E '0,/^([[:space:]]*)listen[[:space:]]+([^;]*80);[[:space:]]*$/{s||\1listen \2;\n\1listen [::]:80;|}' "$conf"
+            changed=1
+            log "Ensured IPv6 HTTP listener in $conf"
+        fi
+        if grep -qE '^[[:space:]]*listen[[:space:]]+.*443[[:space:]]+ssl' "$conf"; then
+            if ! grep -qE '^[[:space:]]*listen[[:space:]]+([^[][^;]*:)?443[[:space:]]+ssl;' "$conf"; then
+                sed -i -E '0,/^([[:space:]]*)listen[[:space:]]+\[::\]:443[[:space:]]+ssl;[[:space:]]*$/{s||\1listen 443 ssl;\n\1listen [::]:443 ssl;|}' "$conf"
+                changed=1
+                log "Ensured IPv4 HTTPS listener in $conf"
+            fi
+            if ! grep -qE '^[[:space:]]*listen[[:space:]]+\[::\]:443[[:space:]]+ssl;' "$conf"; then
+                sed -i -E '0,/^([[:space:]]*)listen[[:space:]]+([^;]*443[[:space:]]+ssl);[[:space:]]*$/{s||\1listen \2;\n\1listen [::]:443 ssl;|}' "$conf"
+                changed=1
+                log "Ensured IPv6 HTTPS listener in $conf"
+            fi
+        fi
+    done
+    [ "$changed" = "1" ] || return 0
+    nginx -t > /dev/null 2>&1 && systemctl reload nginx > /dev/null 2>&1 || warn "Nginx config test failed after listener normalization; not reloading"
+}
+
+repair_panel_domain_site_vhosts() {
+    local panel_domain site_conf base safe_match disabled_path site_name
+    panel_domain=$(detect_panel_domain 2>/dev/null || true)
+    [ -n "$panel_domain" ] || return 0
+    [ -d /etc/nginx/sites-enabled ] || return 0
+
+    for site_conf in /etc/nginx/sites-enabled/*.conf; do
+        [ -f "$site_conf" ] || continue
+        base=$(basename "$site_conf")
+        [ "$base" = "dockpanel-panel.conf" ] && continue
+        if ! awk -v d="$panel_domain" '/^[[:space:]]*server_name[[:space:]]+/ { for (i=2; i<=NF; i++) { gsub(/;/, "", $i); if (tolower($i) == d) found=1 } } END { exit(found ? 0 : 1) }' "$site_conf"; then
+            continue
+        fi
+
+        safe_match=0
+        case "$base" in
+            *.conf)
+                site_name="${base%.conf}"
+                if grep -qE "root[[:space:]]+/var/www/${site_name}(/|;)" "$site_conf" 2>/dev/null \
+                    || grep -qE "access_log[[:space:]]+/var/log/nginx/${site_name}\.access\.log;" "$site_conf" 2>/dev/null \
+                    || grep -qE "error_log[[:space:]]+/var/log/nginx/${site_name}\.error\.log;" "$site_conf" 2>/dev/null; then
+                    safe_match=1
+                fi
+                ;;
+        esac
+
+        if [ "$safe_match" = "1" ]; then
+            mkdir -p /etc/nginx/sites-disabled
+            disabled_path="/etc/nginx/sites-disabled/${base}.panel-domain-conflict.$(date +%Y%m%d%H%M%S)"
+            mv "$site_conf" "$disabled_path"
+            warn "Disabled DockPanel site vhost $site_conf because it claimed panel domain $panel_domain"
+        else
+            warn "Detected site vhost $site_conf claiming panel domain $panel_domain; left untouched because it was not safe to identify"
+        fi
+    done
+}
+
 configure_nginx() {
     header "Configuring Nginx"
 
@@ -791,6 +884,11 @@ server {
     add_header X-XSS-Protection "1; mode=block" always;
 }
 NGINXEOF
+
+    if [ -n "$PANEL_DOMAIN" ]; then
+        normalize_panel_nginx_listens
+        repair_panel_domain_site_vhosts
+    fi
 
     # Test and restart (full restart needed to release port bindings from removed default site)
     if nginx -t > /dev/null 2>&1; then
@@ -942,6 +1040,8 @@ provision_panel_ssl() {
     log "Provisioning Let's Encrypt certificate for $PANEL_DOMAIN..."
     if certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email --redirect 2>/dev/null; then
         log "SSL certificate provisioned for $PANEL_DOMAIN"
+        normalize_panel_nginx_listens
+        repair_panel_domain_site_vhosts
     else
         log "SSL provisioning failed — you can retry manually: certbot --nginx -d $PANEL_DOMAIN"
         log "If using Cloudflare proxy, set SSL mode to 'Full' and try again"

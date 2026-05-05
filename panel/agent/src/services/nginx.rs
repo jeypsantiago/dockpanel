@@ -1,7 +1,7 @@
-use crate::routes::nginx::SiteConfig;
+use crate::routes::{is_valid_domain, nginx::SiteConfig};
+use crate::safe_cmd::safe_command;
 use std::sync::Arc;
 use tera::{Context, Tera};
-use crate::safe_cmd::safe_command;
 
 pub struct CmdOutput {
     pub success: bool,
@@ -25,6 +25,115 @@ fn detect_bind_ip() -> String {
         }
     }
     String::new()
+}
+
+fn normalize_domain_candidate(value: &str) -> Option<String> {
+    let mut s = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_ascii_lowercase();
+
+    if s.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+    {
+        s = rest.to_string();
+    }
+    if let Some(pos) = s.find('@') {
+        s = s[pos + 1..].to_string();
+    }
+    if let Some(pos) = s.find(|c| matches!(c, '/' | '?' | '#')) {
+        s.truncate(pos);
+    }
+    if s.starts_with('[') {
+        return None;
+    }
+    if let Some(pos) = s.find(':') {
+        s.truncate(pos);
+    }
+    s = s.trim_end_matches('.').to_string();
+
+    if is_valid_domain(&s) {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+fn read_panel_domain_from_api_env() -> Option<String> {
+    let content = std::fs::read_to_string("/etc/dockpanel/api.env").ok()?;
+    content.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let value = trimmed.strip_prefix("BASE_URL=")?;
+        normalize_domain_candidate(value)
+    })
+}
+
+fn panel_domains_from_nginx_config(content: &str) -> Vec<String> {
+    let mut domains = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || !trimmed.starts_with("server_name ") {
+            continue;
+        }
+        let names = trimmed
+            .trim_start_matches("server_name ")
+            .trim_end_matches(';');
+        for name in names.split_whitespace() {
+            if let Some(domain) = normalize_domain_candidate(name) {
+                if !domains.contains(&domain) {
+                    domains.push(domain);
+                }
+            }
+        }
+    }
+    domains
+}
+
+fn read_panel_domains_from_nginx() -> Vec<String> {
+    let mut domains = Vec::new();
+    for path in [
+        "/etc/nginx/sites-enabled/dockpanel-panel.conf",
+        "/etc/nginx/conf.d/dockpanel-panel.conf",
+    ] {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for domain in panel_domains_from_nginx_config(&content) {
+            if !domains.contains(&domain) {
+                domains.push(domain);
+            }
+        }
+    }
+    domains
+}
+
+/// Best-effort panel domain discovery for agent-side nginx guardrails.
+pub fn configured_panel_domains() -> Vec<String> {
+    let mut domains = Vec::new();
+    if let Some(domain) = read_panel_domain_from_api_env() {
+        domains.push(domain);
+    }
+    for domain in read_panel_domains_from_nginx() {
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    domains
+}
+
+/// Return the matching panel domain when a site/alias would collide with the panel vhost.
+pub fn reserved_panel_domain_match(domain: &str) -> Option<String> {
+    let requested = normalize_domain_candidate(domain)?;
+    configured_panel_domains()
+        .into_iter()
+        .find(|panel_domain| panel_domain == &requested)
 }
 
 /// Initialize Tera templates with embedded nginx templates.
@@ -381,5 +490,41 @@ pub async fn reload() -> Result<(), String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::error!("Nginx reload failed: {stderr}");
         Err(format!("Nginx reload failed: {stderr}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_panel_domain_candidates() {
+        assert_eq!(
+            normalize_domain_candidate(" https://Panel.Example.COM:8443/path?x=1 "),
+            Some("panel.example.com".to_string())
+        );
+        assert_eq!(
+            normalize_domain_candidate("'admin@Panel.Example.COM.'"),
+            Some("panel.example.com".to_string())
+        );
+        assert_eq!(normalize_domain_candidate("https://[::1]:8443"), None);
+        assert_eq!(normalize_domain_candidate("not a domain"), None);
+    }
+
+    #[test]
+    fn extracts_panel_domains_from_nginx_server_names() {
+        let config = r#"
+            # server_name ignored.example.com;
+            server_name Panel.Example.COM panel.example.com app.example.com:443;
+            server_name _;
+        "#;
+
+        assert_eq!(
+            panel_domains_from_nginx_config(config),
+            vec![
+                "panel.example.com".to_string(),
+                "app.example.com".to_string()
+            ]
+        );
     }
 }

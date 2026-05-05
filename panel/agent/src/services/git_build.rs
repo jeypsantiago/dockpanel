@@ -671,7 +671,63 @@ fn suggest_container_port_in(
 
 /// Auto-detect language and generate a Dockerfile if none exists.
 /// Returns the dockerfile path to use (either the existing one or "Dockerfile" for the generated one).
-pub fn auto_generate_dockerfile(name: &str, dockerfile_path: &str, build_context: &str) -> Result<String, String> {
+fn is_public_frontend_env_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && (key.starts_with("VITE_")
+            || key.starts_with("NEXT_PUBLIC_")
+            || key.starts_with("NUXT_PUBLIC_")
+            || key.starts_with("PUBLIC_"))
+}
+
+fn frontend_build_env_block(env_vars: &HashMap<String, String>) -> String {
+    let mut keys: Vec<&str> = env_vars
+        .keys()
+        .map(String::as_str)
+        .filter(|key| is_public_frontend_env_key(key))
+        .collect();
+    keys.sort_unstable();
+
+    if keys.is_empty() {
+        return String::new();
+    }
+
+    let mut block = String::new();
+    for key in keys {
+        block.push_str(&format!("ARG {key}\nENV {key}=${key}\n"));
+    }
+    block
+}
+
+fn generated_node_dockerfile(pkg: &str, env_vars: &HashMap<String, String>) -> String {
+    let has_build = pkg.contains("\"build\"");
+    let has_next = pkg.contains("\"next\"");
+    let has_nuxt = pkg.contains("\"nuxt\"");
+    let frontend_env = frontend_build_env_block(env_vars);
+
+    if has_next {
+        // Next.js
+        format!("FROM node:20-alpine AS builder\nWORKDIR /app\nCOPY package*.json ./\nRUN npm install\nCOPY . .\n{frontend_env}RUN npm run build\n\nFROM node:20-alpine\nWORKDIR /app\nCOPY --from=builder /app/.next ./.next\nCOPY --from=builder /app/node_modules ./node_modules\nCOPY --from=builder /app/package.json ./\nCOPY --from=builder /app/public ./public\nEXPOSE 3000\nCMD [\"npm\", \"start\"]\n")
+    } else if has_nuxt {
+        // Nuxt
+        format!("FROM node:20-alpine AS builder\nWORKDIR /app\nCOPY package*.json ./\nRUN npm install\nCOPY . .\n{frontend_env}RUN npm run build\n\nFROM node:20-alpine\nWORKDIR /app\nCOPY --from=builder /app/.output ./.output\nEXPOSE 3000\nCMD [\"node\", \".output/server/index.mjs\"]\n")
+    } else if has_build {
+        // Generic Node.js with build step (SPA/React/Vue)
+        format!("FROM node:20-alpine AS builder\nWORKDIR /app\nCOPY package*.json ./\nRUN npm install\nCOPY . .\n{frontend_env}RUN npm run build\n\nFROM nginx:alpine\nCOPY --from=builder /app/dist /usr/share/nginx/html\nEXPOSE 80\n")
+    } else {
+        // Plain Node.js server
+        "FROM node:20-alpine\nWORKDIR /app\nCOPY package*.json ./\nRUN npm install --omit=dev\nCOPY . .\nEXPOSE 3000\nCMD [\"node\", \"index.js\"]\n".to_string()
+    }
+}
+
+pub fn auto_generate_dockerfile(
+    name: &str,
+    dockerfile_path: &str,
+    build_context: &str,
+    env_vars: &HashMap<String, String>,
+) -> Result<String, String> {
     let deploy_dir = format!("{GIT_BASE_DIR}/{name}");
     let context_dir = if build_context == "." { deploy_dir.clone() } else { format!("{deploy_dir}/{build_context}") };
     let df_path = std::path::Path::new(&context_dir).join(dockerfile_path);
@@ -686,23 +742,7 @@ pub fn auto_generate_dockerfile(name: &str, dockerfile_path: &str, build_context
     let generated = if std::path::Path::new(&context_dir).join("package.json").exists() {
         // Node.js
         let pkg = std::fs::read_to_string(std::path::Path::new(&context_dir).join("package.json")).unwrap_or_default();
-        let has_build = pkg.contains("\"build\"");
-        let has_next = pkg.contains("\"next\"");
-        let has_nuxt = pkg.contains("\"nuxt\"");
-
-        if has_next {
-            // Next.js
-            "FROM node:20-alpine AS builder\nWORKDIR /app\nCOPY package*.json ./\nRUN npm install\nCOPY . .\nRUN npm run build\n\nFROM node:20-alpine\nWORKDIR /app\nCOPY --from=builder /app/.next ./.next\nCOPY --from=builder /app/node_modules ./node_modules\nCOPY --from=builder /app/package.json ./\nCOPY --from=builder /app/public ./public\nEXPOSE 3000\nCMD [\"npm\", \"start\"]\n".to_string()
-        } else if has_nuxt {
-            // Nuxt
-            "FROM node:20-alpine AS builder\nWORKDIR /app\nCOPY package*.json ./\nRUN npm install\nCOPY . .\nRUN npm run build\n\nFROM node:20-alpine\nWORKDIR /app\nCOPY --from=builder /app/.output ./.output\nEXPOSE 3000\nCMD [\"node\", \".output/server/index.mjs\"]\n".to_string()
-        } else if has_build {
-            // Generic Node.js with build step (SPA/React/Vue)
-            "FROM node:20-alpine AS builder\nWORKDIR /app\nCOPY package*.json ./\nRUN npm install\nCOPY . .\nRUN npm run build\n\nFROM nginx:alpine\nCOPY --from=builder /app/dist /usr/share/nginx/html\nEXPOSE 80\n".to_string()
-        } else {
-            // Plain Node.js server
-            "FROM node:20-alpine\nWORKDIR /app\nCOPY package*.json ./\nRUN npm install --omit=dev\nCOPY . .\nEXPOSE 3000\nCMD [\"node\", \"index.js\"]\n".to_string()
-        }
+        generated_node_dockerfile(&pkg, env_vars)
     } else if std::path::Path::new(&context_dir).join("requirements.txt").exists() {
         // Python
         let reqs = std::fs::read_to_string(std::path::Path::new(&context_dir).join("requirements.txt"))
@@ -1426,5 +1466,46 @@ mod tests {
         assert_eq!(port, 3000);
 
         fs::remove_dir_all(base_dir).ok();
+    }
+
+    #[test]
+    fn frontend_build_env_block_only_includes_public_frontend_keys() {
+        let env = HashMap::from([
+            ("VITE_POCKETBASE_URL".to_string(), "https://api.example.com".to_string()),
+            ("NEXT_PUBLIC_API_URL".to_string(), "https://next.example.com".to_string()),
+            ("NUXT_PUBLIC_API_URL".to_string(), "https://nuxt.example.com".to_string()),
+            ("PUBLIC_ASSET_URL".to_string(), "https://cdn.example.com".to_string()),
+            ("DATABASE_URL".to_string(), "postgres://secret".to_string()),
+            ("vite_lowercase".to_string(), "ignored".to_string()),
+        ]);
+
+        let block = frontend_build_env_block(&env);
+
+        assert!(block.contains("ARG VITE_POCKETBASE_URL\nENV VITE_POCKETBASE_URL=$VITE_POCKETBASE_URL\n"));
+        assert!(block.contains("ARG NEXT_PUBLIC_API_URL\nENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL\n"));
+        assert!(block.contains("ARG NUXT_PUBLIC_API_URL\nENV NUXT_PUBLIC_API_URL=$NUXT_PUBLIC_API_URL\n"));
+        assert!(block.contains("ARG PUBLIC_ASSET_URL\nENV PUBLIC_ASSET_URL=$PUBLIC_ASSET_URL\n"));
+        assert!(!block.contains("DATABASE_URL"));
+        assert!(!block.contains("vite_lowercase"));
+    }
+
+    #[test]
+    fn generated_frontend_dockerfile_only_exposes_public_env_build_values() {
+        let env = HashMap::from([
+            ("VITE_API_URL".to_string(), "https://api.example.com".to_string()),
+            ("NEXT_PUBLIC_SITE_URL".to_string(), "https://app.example.com".to_string()),
+            ("DATABASE_URL".to_string(), "postgres://secret".to_string()),
+            ("SECRET_KEY".to_string(), "secret".to_string()),
+        ]);
+        let pkg = r#"{"scripts":{"build":"vite build"},"dependencies":{"@vitejs/plugin-react":"latest"}}"#;
+
+        let dockerfile = generated_node_dockerfile(pkg, &env);
+
+        assert!(dockerfile.contains("ARG VITE_API_URL\nENV VITE_API_URL=$VITE_API_URL\n"));
+        assert!(dockerfile.contains("ARG NEXT_PUBLIC_SITE_URL\nENV NEXT_PUBLIC_SITE_URL=$NEXT_PUBLIC_SITE_URL\n"));
+        assert!(dockerfile.contains("RUN npm run build"));
+        assert!(!dockerfile.contains("DATABASE_URL"));
+        assert!(!dockerfile.contains("SECRET_KEY"));
+        assert!(!dockerfile.contains("postgres://secret"));
     }
 }
