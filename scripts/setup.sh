@@ -756,6 +756,60 @@ repair_panel_domain_site_vhosts() {
     done
 }
 
+ensure_panel_https_fallback() {
+    local panel_domain conf cert_dir cert_key cert_chain changed=0
+    panel_domain=$(detect_panel_domain 2>/dev/null || true)
+    [ -n "$panel_domain" ] || return 0
+
+    cert_dir="/etc/dockpanel/ssl/${panel_domain}"
+    cert_chain="${cert_dir}/fullchain.pem"
+    cert_key="${cert_dir}/privkey.pem"
+
+    if [ ! -f "$cert_chain" ] || [ ! -f "$cert_key" ]; then
+        if ! command -v openssl >/dev/null 2>&1; then
+            warn "OpenSSL not found; cannot create temporary panel HTTPS certificate"
+            return 0
+        fi
+        mkdir -p "$cert_dir"
+        if openssl req -x509 -nodes -newkey rsa:2048 -days 30 \
+            -subj "/CN=${panel_domain}" \
+            -keyout "$cert_key" \
+            -out "$cert_chain" >/dev/null 2>&1; then
+            chmod 600 "$cert_key"
+            log "Created temporary origin TLS certificate for ${panel_domain}"
+        else
+            warn "Could not create temporary origin TLS certificate for ${panel_domain}"
+            return 0
+        fi
+    fi
+
+    for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
+        [ -f "$conf" ] || continue
+        if ! awk -v d="$panel_domain" '/^[[:space:]]*server_name[[:space:]]+/ { for (i=2; i<=NF; i++) { gsub(/;/, "", $i); if (tolower($i) == d) found=1 } } END { exit(found ? 0 : 1) }' "$conf"; then
+            continue
+        fi
+        if ! grep -qE "^[[:space:]]*listen[[:space:]].*443[[:space:]]+ssl" "$conf"; then
+            sed -i -E '0,/^([[:space:]]*)listen[[:space:]][^;]*80;[[:space:]]*$/{s||&\n\1listen 443 ssl;\n\1listen [::]:443 ssl;|}' "$conf"
+            changed=1
+        fi
+        if ! grep -qE "^[[:space:]]*ssl_certificate[[:space:]]+" "$conf"; then
+            sed -i -E "/^[[:space:]]*server_name[[:space:]]+/a\\
+\\
+    ssl_certificate ${cert_chain};\\
+    ssl_certificate_key ${cert_key};" "$conf"
+            changed=1
+        fi
+    done
+
+    [ "$changed" = "1" ] || return 0
+    if nginx -t > /dev/null 2>&1; then
+        systemctl reload nginx > /dev/null 2>&1 || true
+        log "Panel HTTPS fallback enabled for ${panel_domain}"
+    else
+        warn "Nginx config test failed after panel HTTPS fallback; leaving current config for inspection"
+    fi
+}
+
 configure_nginx() {
     header "Configuring Nginx"
 
@@ -1045,6 +1099,7 @@ provision_panel_ssl() {
     else
         log "SSL provisioning failed — you can retry manually: certbot --nginx -d $PANEL_DOMAIN"
         log "If using Cloudflare proxy, set SSL mode to 'Full' and try again"
+        ensure_panel_https_fallback
     fi
 }
 

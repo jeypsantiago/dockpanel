@@ -187,6 +187,7 @@ export default function GitDeploys() {
           branch: formBranch || "main",
           dockerfile: formDockerfile || "Dockerfile",
           build_context: formBuildContext || ".",
+          key_path: selected?.deploy_key_path || null,
         });
         if (!cancelled && result?.container_port) {
           setPortSuggestion(result.container_port);
@@ -209,7 +210,7 @@ export default function GitDeploys() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [showModal, formRepo, formBranch, formDockerfile, formBuildContext, editing, portManual]);
+  }, [showModal, formRepo, formBranch, formDockerfile, formBuildContext, editing, portManual, selected?.deploy_key_path]);
 
   const resetForm = () => {
     setFormName("");
@@ -1028,7 +1029,7 @@ export default function GitDeploys() {
                       ? "Detecting the app port from the repository..."
                       : portSuggestion
                         ? `Detected port from repo: ${portSuggestion}. Leave this blank to auto-use the detected value.`
-                        : "Leave blank to auto-detect from the repository. The host port is assigned automatically."}
+                        : "Could not detect the app port automatically. Enter it manually, then save."}
                   </p>
                 </div>
                 <div>
