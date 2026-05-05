@@ -624,25 +624,20 @@ pub async fn update(
     let dockerfile = body.dockerfile.as_deref().unwrap_or(&current.dockerfile);
     let build_context = body.build_context.as_deref().unwrap_or(&current.build_context);
     let port_env_source = env_vars.as_ref().unwrap_or(&current.env_vars);
-    let env_port = runtime_port_from_env(port_env_source);
-    let resolved_container_port = match (body.container_port, env_port) {
-        // The edit form sends the current saved port even when the user only changed env vars.
-        // If PORT is present in the submitted env and the submitted port is just the old saved
-        // value, keep Docker's published container port aligned with the app runtime port.
-        (Some(port), Some(env_port)) if body.env_vars.is_some() && port == current.container_port => Some(env_port),
-        (Some(port), _) => Some(port),
-        (None, Some(port)) => Some(port),
-        (None, None) => {
-            inspect_container_port(
-                &agent,
-                repo_url,
-                branch,
-                dockerfile,
-                build_context,
-                current.deploy_key_path.as_deref(),
-            )
-            .await
-        }
+    let resolved_container_port = if let Some(port) = body.container_port {
+        Some(port)
+    } else if let Some(port) = runtime_port_from_env(port_env_source) {
+        Some(port)
+    } else {
+        inspect_container_port(
+            &agent,
+            repo_url,
+            branch,
+            dockerfile,
+            build_context,
+            current.deploy_key_path.as_deref(),
+        )
+        .await
     };
 
     let deploy: GitDeploy = sqlx::query_as(
