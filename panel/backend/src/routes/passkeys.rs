@@ -709,7 +709,7 @@ pub async fn auth_complete(
     }
 
     // Passkey login bypasses 2FA (the passkey IS the strong second factor)
-    let (_token, cookie, jti) = super::auth::issue_session_pub(&state, &user)?;
+    let (_token, cookie, jti) = super::auth::issue_session_pub(&state, &user, &headers)?;
 
     // Record session
     let user_agent = headers.get(axum::http::header::USER_AGENT)

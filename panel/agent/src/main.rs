@@ -181,11 +181,30 @@ async fn main() {
 
     let listener = UnixListener::bind(SOCKET_PATH).expect("Failed to bind Unix socket");
 
-    // Set socket permissions — owner-only access (backend runs as same user)
+    // Socket needs to be reachable from nginx (running as www-data on Debian/Ubuntu,
+    // nginx on RHEL-likes) so the panel's `proxy_pass http://unix:.../agent.sock` works.
+    // The systemd unit's ExecStartPost previously did this, but it occasionally failed
+    // silently (e.g. on rapid restarts), leaving the socket 0600 root:root and the
+    // panel toasting "Failed to load system update status". Doing it inline here makes
+    // the agent self-sufficient (#54 followup, v2.8.14); the unit's ExecStartPost stays
+    // as belt-and-suspenders.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(0o600)).ok();
+        let group_gid = ["www-data", "nginx"]
+            .iter()
+            .find_map(|name| {
+                let cname = std::ffi::CString::new(*name).ok()?;
+                let grp = unsafe { libc::getgrnam(cname.as_ptr()) };
+                if grp.is_null() { None } else { Some(unsafe { (*grp).gr_gid }) }
+            });
+        if let Some(gid) = group_gid {
+            let path = std::ffi::CString::new(SOCKET_PATH).expect("socket path null");
+            // chown(socket, -1 (keep owner), gid) — sets group only.
+            unsafe { libc::chown(path.as_ptr(), libc::uid_t::MAX, gid) };
+        }
+        // Group-readable/writable so nginx (in the resolved group) can connect.
+        std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(0o660)).ok();
     }
 
     // Load or generate the agent TLS cert now, so the fingerprint is available

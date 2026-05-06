@@ -285,7 +285,7 @@ pub async fn login(
         ));
     }
 
-    let (_token, cookie, jti) = issue_session(&state, &user)?;
+    let (_token, cookie, jti) = issue_session(&state, &user, &headers)?;
 
     // Record session
     let user_agent = headers
@@ -383,14 +383,44 @@ pub async fn login(
     ))
 }
 
+/// True when this request arrived over HTTPS, either directly or via a reverse
+/// proxy that set X-Forwarded-Proto. Browsers reject Secure cookies on plain
+/// HTTP, so set Secure only when the connection is actually encrypted.
+/// Fixes #47 — HTTP-on-IP installs were stuck in a login bounce because the
+/// previous logic set Secure whenever BASE_URL was empty.
+pub fn request_is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+}
+
+fn cookie_secure_flag(state: &AppState, headers: &HeaderMap) -> &'static str {
+    let base_is_https = state.config.base_url.starts_with("https");
+    if base_is_https || request_is_https(headers) {
+        "; Secure"
+    } else {
+        ""
+    }
+}
+
 /// Issue a JWT session token + cookie for a user.
 /// Returns (token, cookie, jti) so callers can record the session.
-fn issue_session(state: &AppState, user: &User) -> Result<(String, String, String), ApiError> {
-    issue_session_pub(state, user)
+fn issue_session(
+    state: &AppState,
+    user: &User,
+    headers: &HeaderMap,
+) -> Result<(String, String, String), ApiError> {
+    issue_session_pub(state, user, headers)
 }
 
 /// Public version for use by passkey auth (same logic).
-pub fn issue_session_pub(state: &AppState, user: &User) -> Result<(String, String, String), ApiError> {
+pub fn issue_session_pub(
+    state: &AppState,
+    user: &User,
+    headers: &HeaderMap,
+) -> Result<(String, String, String), ApiError> {
     let now = chrono::Utc::now();
     let jti = uuid::Uuid::new_v4().to_string();
     let claims = Claims {
@@ -409,12 +439,7 @@ pub fn issue_session_pub(state: &AppState, user: &User) -> Result<(String, Strin
     )
     .map_err(|e| internal_error("login", e))?;
 
-    // Default to Secure when BASE_URL is not set (most deployments use HTTPS)
-    let secure_flag = if state.config.base_url.is_empty() || state.config.base_url.starts_with("https") {
-        "; Secure"
-    } else {
-        ""
-    };
+    let secure_flag = cookie_secure_flag(state, headers);
     let cookie = format!(
         "token={token}; Path=/; HttpOnly{secure_flag}; SameSite=Lax; Max-Age=7200"
     );
@@ -433,6 +458,7 @@ fn record_login_attempt(
 /// POST /api/auth/logout — Clear the auth cookie and blacklist the token JTI.
 pub async fn logout(
     State(state): State<AppState>,
+    headers: HeaderMap,
     auth: Result<AuthUser, crate::error::ApiError>,
 ) -> (StatusCode, [(header::HeaderName, String); 1], Json<serde_json::Value>) {
     // Blacklist the token's JTI so it cannot be reused
@@ -452,12 +478,7 @@ pub async fn logout(
         }
     }
 
-    // Default to Secure when BASE_URL is not set (most deployments use HTTPS)
-    let secure_flag = if state.config.base_url.is_empty() || state.config.base_url.starts_with("https") {
-        "; Secure"
-    } else {
-        ""
-    };
+    let secure_flag = cookie_secure_flag(&state, &headers);
     let cookie = format!("token=; Path=/; HttpOnly{secure_flag}; SameSite=Lax; Max-Age=0");
     (
         StatusCode::OK,
@@ -1125,7 +1146,7 @@ pub async fn twofa_verify(
         attempts.remove(&user_id);
     }
 
-    let (_token, cookie, jti) = issue_session(&state, &user)?;
+    let (_token, cookie, jti) = issue_session(&state, &user, &headers)?;
 
     // Record session
     let ip = headers

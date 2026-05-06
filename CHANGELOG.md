@@ -6,6 +6,107 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.14] - 2026-05-06
+
+### Fixed
+
+- **WordPress provisioning failures on every fresh install** ([#54](https://github.com/ovexro/dockpanel/issues/54)).
+  Three independent regressions surfaced when the v2.8.12 strict
+  sandbox shipped, each only firing on specific paths so they slipped
+  through the v2.8.13 verification:
+  - `Failed to download wp-cli` — `services/wordpress.rs::ensure_cli`
+    ran `safe_command("curl") -o /usr/local/bin/wp`, but
+    `/usr/local/bin` is not in the agent's `ReadWritePaths` under
+    `ProtectSystem=strict` so the write was blocked silently and
+    bubbled up as a 422 on the WP install endpoint. Switched to
+    `safe_command_unsandboxed("curl", &[])` (the same `systemd-run`
+    escape used for apt/dpkg in v2.8.12) and now surface the curl
+    stderr in the error message instead of just the static "Failed
+    to download wp-cli" string.
+  - `mkdir() "/var/cache/nginx/fastcgi/<site>" failed (ENOENT)` —
+    `routes/nginx.rs::put_site` called `create_dir_all` on the
+    per-site FastCGI cache path before rendering the vhost, but
+    `/var/cache/nginx` was not in the agent's `ReadWritePaths` so
+    the create silently failed (only a `tracing::warn!`). The
+    config was written anyway; nginx -t then fired its own mkdir of
+    the cache leaf, found no parent, and rejected the reload. Added
+    `/var/cache/nginx` to `ReadWritePaths=` in the canonical unit,
+    pre-created `/var/cache/nginx/fastcgi` in `setup.sh` and
+    `update.sh`, and promoted the agent-side `create_dir_all`
+    failure from a `warn!` to a 500 with an actionable message
+    ("Ensure /var/cache/nginx is in the agent's ReadWritePaths") so
+    we never again render a config we know nginx can't validate.
+  - `tar: unrecognized option '--no-dereference'` — three call sites
+    (`services/backups.rs`, `services/wordpress.rs::create_update_snapshot`,
+    `routes/mail.rs::mailbox_backup`) passed `--no-dereference` to
+    `tar -c`. GNU tar 1.35 (current Trixie/Noble default and the
+    version on this server) does not accept that option in create
+    mode, so every site backup, every WP update snapshot, and every
+    mail backup since the flag was introduced has been failing
+    silently — including on the panel's own demo. GNU tar's
+    create-mode default is already "do not follow symlinks", so the
+    fix is to drop the flag from all three sites.
+
+- **`curl … {panel_url}/install-agent.sh | bash` returned the SPA
+  HTML** ([#56](https://github.com/ovexro/dockpanel/issues/56)). The
+  multi-server install command surfaced in `routes/servers.rs`
+  pointed users at `{panel_url}/install-agent.sh`, but the panel's
+  nginx config has `try_files $uri $uri/ /index.html;` with no
+  override for that path — so the URI fell through to the SPA's
+  `index.html` and `bash` choked on `<!DOCTYPE html>`. The script
+  also wasn't deployed under any served path. Fixed by having
+  `setup.sh` and `update.sh` copy `scripts/install-agent.sh` into
+  `$FE_ROOT/install-agent.sh` so the existing `try_files $uri` rule
+  serves it directly with the right MIME.
+
+- **HTTP-on-IP installs were stuck in a login bounce**
+  ([#47](https://github.com/ovexro/dockpanel/issues/47)). The cookie
+  helper in `routes/auth.rs::issue_session` set `Secure` whenever
+  `BASE_URL` was empty (the assumption being that production
+  deployments use HTTPS and an empty default should not regress
+  them). For users running on the bare `http://<ip>:<port>` URL
+  before adding a domain, the browser silently dropped the `Secure`
+  cookie on the plain-HTTP response and `/api/auth/me` then 401'd
+  on the very next request — login appeared to succeed and
+  immediately bounced back to the login screen. Replaced the
+  BASE_URL-only check with a combined `BASE_URL=https://… ||
+  X-Forwarded-Proto: https` check (nginx already sets
+  `X-Forwarded-Proto $scheme`), and threaded the request `HeaderMap`
+  through `issue_session_pub` / `logout` / OAuth `callback` /
+  passkey `auth_complete` so every login path uses the same scheme
+  detection.
+
+- **`/run/dockpanel` disappeared mid-upgrade and pinned the agent at
+  StartLimitBurst** (v2.8.13 followup, surfaced during the demo
+  upgrade-path test). `update.sh` mkdir's `/var/run/dockpanel`
+  before the `systemctl stop / start` cycle, but between stop and
+  start the directory disappeared on Ubuntu — the agent's namespace
+  mount (which now resolves `/run/dockpanel` as a `ReadWritePaths=`
+  symlink target) failed five times in 60s and the unit refused to
+  start until manual `systemd-tmpfiles --create` plus
+  `systemctl reset-failed`. Added `RuntimeDirectory=dockpanel` and
+  `RuntimeDirectoryPreserve=yes` to the canonical unit so systemd
+  creates and persists the directory itself, which fires before the
+  namespace setup and survives every restart.
+
+- **Agent socket occasionally left at 0600 root:root, breaking the
+  panel's "Failed to load system update status" toast.** The
+  systemd unit's `ExecStartPost` was the only thing that chown'd
+  the socket to `www-data` and chmod'd it to 0660 — and it failed
+  silently in some restart sequences, leaving the panel unable to
+  reach the agent over its UNIX socket. The agent now sets the
+  permissions inline right after `UnixListener::bind` (via libc
+  `getgrnam` / `chown` / `set_permissions`), so the unit's
+  `ExecStartPost` is belt-and-suspenders rather than load-bearing.
+
+- **Mail provisioning's `groupadd`/`useradd` for the vmail user
+  failed under strict sandbox.** Same family as #54-A: the
+  `safe_command` wrapper runs sandboxed, but the user-management
+  binaries write `/etc/passwd` / `/etc/shadow` / `/etc/group`,
+  which are too sensitive to put in `ReadWritePaths=`. Switched
+  both calls to `safe_command_unsandboxed("groupadd", &[])` /
+  `safe_command_unsandboxed("useradd", &[])`.
+
 ## [2.8.13] - 2026-05-02
 
 ### Changed

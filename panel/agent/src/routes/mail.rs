@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use crate::safe_cmd::safe_command;
+use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
 use std::path::Path;
 
 use super::AppState;
@@ -169,9 +169,12 @@ async fn mail_install() -> Result<Json<serde_json::Value>, ApiErr> {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Package install failed: {}", stderr.chars().take(200).collect::<String>())));
     }
 
-    // 2. Create vmail user (uid/gid 5000)
-    let _ = safe_command("groupadd").args(["-g", "5000", "vmail"]).output().await;
-    let _ = safe_command("useradd").args(["-g", "5000", "-u", "5000", "-d", VMAIL_DIR, "-s", "/usr/sbin/nologin", "-m", "vmail"]).output().await;
+    // 2. Create vmail user (uid/gid 5000).
+    // groupadd/useradd write /etc/passwd, /etc/shadow, /etc/group — all too
+    // sensitive to put in the agent's ReadWritePaths. Run unsandboxed via
+    // systemd-run, the same escape used for apt/dpkg (#54-A pattern, v2.8.14).
+    let _ = safe_command_unsandboxed("groupadd", &[]).args(["-g", "5000", "vmail"]).output().await;
+    let _ = safe_command_unsandboxed("useradd", &[]).args(["-g", "5000", "-u", "5000", "-d", VMAIL_DIR, "-s", "/usr/sbin/nologin", "-m", "vmail"]).output().await;
     tokio::fs::create_dir_all(VMAIL_DIR).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to create vmail dir: {e}")))?;
     let _ = safe_command("chown").args(["-R", "vmail:vmail", VMAIL_DIR]).output().await;
@@ -1200,7 +1203,7 @@ async fn mailbox_backup(Json(body): Json<MailboxBackupRequest>) -> Result<Json<s
 
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("tar").args(["--no-dereference", "czf", &backup_file, "-C", &format!("/var/vmail/{domain}"), user]).output()
+        safe_command("tar").args(["czf", &backup_file, "-C", &format!("/var/vmail/{domain}"), user]).output()
     ).await
         .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, "Backup timed out"))?
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Backup failed: {e}")))?;

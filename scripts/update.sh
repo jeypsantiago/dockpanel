@@ -202,7 +202,8 @@ mkdir -p /var/lib/dockpanel/git
 # v2.8.13 expanded the RWP list — systemd fails the namespace mount on
 # missing entries, so pre-create everything the canonical unit references.
 for d in /etc/postfix /etc/dovecot /var/vmail /var/spool/postfix /run/opendkim /var/lib/nginx \
-         /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns /etc/letsencrypt; do
+         /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns /etc/letsencrypt \
+         /var/cache/nginx/fastcgi; do
     [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || true
 done
 echo "d /run/dockpanel 0755 root root -" > /etc/tmpfiles.d/dockpanel.conf 2>/dev/null || true
@@ -253,6 +254,18 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
             nginx -t > /dev/null 2>&1 && nginx -s reload > /dev/null 2>&1
         fi
     done
+else
+    FE_DIST="${REPO_DIR}/panel/frontend/dist"
+fi
+
+# ── Drop install-agent.sh into FE_ROOT (#56, v2.8.14) ─────────────────────
+# Panel SPA-fallback nginx serves $uri before falling back to index.html.
+# Without the script present in FE_ROOT, `curl {panel}/install-agent.sh | bash`
+# returns the SPA HTML and fails with 'syntax error near unexpected token'.
+if [ -f "${REPO_DIR}/scripts/install-agent.sh" ] && [ -d "$FE_DIST" ]; then
+    cp "${REPO_DIR}/scripts/install-agent.sh" "$FE_DIST/install-agent.sh"
+    chmod 644 "$FE_DIST/install-agent.sh"
+    log "Refreshed install-agent.sh in $FE_DIST"
 fi
 
 # ── Migrate panel nginx config to bind IPv6 (fixes site-vhost dual-stack hijack) ──

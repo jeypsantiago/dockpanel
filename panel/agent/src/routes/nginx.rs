@@ -175,20 +175,31 @@ async fn put_site(
         }
     }
 
-    // Create FastCGI cache directory if enabled
+    // Create FastCGI cache directory if enabled.
+    // Must succeed: nginx -t calls mkdir() on this path at config-test time and
+    // fails the whole reload if the parent doesn't exist. Returning here
+    // prevents writing a config we know nginx can't validate (#54-B, v2.8.14).
     if config.fastcgi_cache.unwrap_or(false) && config.runtime == "php" {
         let cache_dir = format!(
             "/var/cache/nginx/fastcgi/{}",
             domain.replace('.', "_")
         );
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-            tracing::warn!("Failed to create cache dir {cache_dir}: {e}");
-        } else {
-            // Ensure nginx can write to it
-            let _ = safe_command_sync("chown")
-                .args(["www-data:www-data", &cache_dir])
-                .output();
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(NginxResponse {
+                    success: false,
+                    message: format!(
+                        "Failed to create FastCGI cache dir {cache_dir}: {e}. \
+                         Ensure /var/cache/nginx is in the agent's ReadWritePaths."
+                    ),
+                }),
+            ));
         }
+        // Ensure nginx can write to it
+        let _ = safe_command_sync("chown")
+            .args(["www-data:www-data", &cache_dir])
+            .output();
     }
 
     // Render nginx config from template

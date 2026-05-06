@@ -349,6 +349,7 @@ create_directories() {
     mkdir -p /var/lib/nginx /etc/letsencrypt /var/lib/dpkg /var/cache/apt /var/lib/apt
     mkdir -p /etc/php /var/spool/cron /var/lib/dockpanel/git /var/lib/dockpanel/recordings
     mkdir -p /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns
+    mkdir -p /var/cache/nginx/fastcgi
     touch /etc/opendkim.conf /run/nginx.pid 2>/dev/null || true
 
     log "Directories created"
@@ -691,6 +692,15 @@ configure_nginx() {
         FE_ROOT="$FRONTEND_DIST"
     else
         FE_ROOT="${FRONTEND_DIR}/dist"
+    fi
+
+    # Drop install-agent.sh into FE_ROOT so the panel's SPA-fallback nginx config
+    # serves it via `try_files $uri` (instead of returning the SPA index.html).
+    # Backend at panel/backend/src/routes/servers.rs prints `curl … {panel_url}/install-agent.sh`
+    # in the multi-server install command — this is what makes that URL resolve. (#56, v2.8.14)
+    if [ -f "$REPO_DIR/scripts/install-agent.sh" ] && [ -d "$FE_ROOT" ]; then
+        cp "$REPO_DIR/scripts/install-agent.sh" "$FE_ROOT/install-agent.sh"
+        chmod 644 "$FE_ROOT/install-agent.sh"
     fi
 
     local SERVER_NAME="_"
