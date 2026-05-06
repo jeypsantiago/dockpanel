@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.15] - 2026-05-06
+
+### Fixed
+
+- **`update.sh` skipped the repo sync in `INSTALL_FROM_RELEASE=1` mode,
+  so v2.8.14's canonical-unit changes never deployed on the standard
+  upgrade path.** Found by the v2.8.13 → v2.8.14 VPS upgrade test:
+  binaries upgraded to v2.8.14 successfully, but the systemd unit file
+  on disk was still v2.8.13's content (no `RuntimeDirectory=dockpanel`,
+  no `/var/cache/nginx` in `ReadWritePaths=`). Root cause: line 106
+  gated `git pull` behind `INSTALL_FROM_RELEASE != 1`, but the code at
+  line 215 deploys the canonical unit from `$AGENT_SRC` regardless of
+  mode. Same family as the v2.8.13 "dev fiction" bug — canonical file
+  in repo, installer reads stale on-disk copy.
+  - `git pull --ff-only` also didn't cover installs cloned with
+    `-b v2.8.13` (or any explicit tag — they end up on a detached HEAD
+    with no local `main`). Replaced the conditional with an
+    unconditional `git fetch --depth=1 origin main` + `git reset --hard
+    FETCH_HEAD` so the canonical unit, nginx templates, and
+    install-agent.sh are always at the latest origin/main when
+    update.sh runs. Operators who already upgraded to v2.8.14 via
+    `bash update.sh` should re-run it on v2.8.15 to pick up the unit
+    changes; the self-refresh logic added in v2.7.13 will fetch the
+    fixed update.sh from this release.
+
 ## [2.8.14] - 2026-05-06
 
 ### Fixed

@@ -102,13 +102,31 @@ echo ""
 echo -e "${GREEN}${BOLD}DockPanel Updater${NC}"
 echo ""
 
-# ── Pull latest code (only for source builds) ────────────────────────────
-if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ -d "$REPO_DIR/.git" ]; then
-    log "Pulling latest changes..."
-    (cd "$REPO_DIR" && git stash -q 2>/dev/null; git pull --ff-only; git stash pop -q 2>/dev/null || true) || {
-        error "Git pull failed. Resolve conflicts manually."
-        exit 1
-    }
+# ── Sync repo to origin/main ──────────────────────────────────────────────
+# Both modes need a fresh tree: the canonical systemd unit
+# (panel/agent/dockpanel-agent.service), nginx templates, install-agent.sh,
+# and a few other repo-resident files are deployed from $REPO_DIR. Without a
+# pull, `bash /opt/dockpanel/scripts/update.sh` would download new binaries
+# but redeploy the OLD canonical unit — exactly what stranded the v2.8.13 →
+# v2.8.14 upgrade-path test (RuntimeDirectory=dockpanel and /var/cache/nginx
+# in ReadWritePaths never reached the deployed unit). v2.8.15.
+#
+# `git pull --ff-only` doesn't cover installs cloned with `-b vX.Y.Z` (those
+# end up on a detached HEAD with no `main` known locally), so the sync uses
+# `git fetch origin main` + `git reset --hard FETCH_HEAD` to forcibly track
+# main. Local edits to /opt/dockpanel are unsupported (it's a deploy
+# artifact, not a working tree) — `git stash` captures any incidental drift
+# in case anyone wants to inspect it post-upgrade.
+if [ -d "$REPO_DIR/.git" ]; then
+    log "Syncing repo to latest origin/main..."
+    (cd "$REPO_DIR" && {
+        git stash -q 2>/dev/null || true
+        if git fetch --depth=1 origin main 2>/dev/null; then
+            git reset --hard FETCH_HEAD 2>&1 | tail -1 >/dev/null || true
+        else
+            log "Warning: git fetch failed — deploying from existing on-disk source"
+        fi
+    }) || log "Warning: repo sync failed — deploying from existing on-disk source"
 fi
 
 # ── Backup database before upgrade ────────────────────────────────────────
