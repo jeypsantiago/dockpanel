@@ -38,6 +38,38 @@ CLI_BIN="/usr/local/bin/dockpanel"
 INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-0}"
 GITHUB_REPO="ovexro/dockpanel"
 
+# ── Mode detection (must run BEFORE self-refresh) ─────────────────────────
+# Self-refresh is gated on INSTALL_FROM_RELEASE=1, so the auto-detect that
+# flips it to 1 has to happen first. v2.8.15 and earlier had this in the
+# wrong order: a user running `bash update.sh` (no env vars) entered with
+# INSTALL_FROM_RELEASE=0, failed the self-refresh check, then got bumped
+# to 1 by auto-detect — but with the stale local script still running.
+# Result: binaries upgrade fine, but script-side fixes (unit files, nginx
+# tweaks, install-agent.sh deploy) never reach pre-v2.8.16 panels.
+if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
+    log "No source found — switching to pre-built binary download"
+    INSTALL_FROM_RELEASE=1
+fi
+
+# Auto-detect: if Rust toolchain isn't available, use release binaries.
+# Production VPS installs typically don't have cargo on PATH (and usually
+# don't have enough RAM to compile rustc's dep tree — proc-macro2 OOMs at
+# ~1-2 GB). Fall back to the pre-built artifacts on the matching tag rather
+# than asking the operator to install rustup just to update.
+if [ "$INSTALL_FROM_RELEASE" != "1" ] \
+   && ! command -v cargo > /dev/null 2>&1 \
+   && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+    log "Rust toolchain not found — switching to pre-built binary download"
+    log "(set BUILD_FROM_SOURCE=1 to force compile-from-source instead)"
+    INSTALL_FROM_RELEASE=1
+fi
+
+# Explicit opt-in to keep compile-from-source behaviour even when cargo
+# is on PATH (e.g. for developers iterating on a checkout).
+if [ "${BUILD_FROM_SOURCE:-0}" = "1" ]; then
+    INSTALL_FROM_RELEASE=0
+fi
+
 # ── Self-refresh ──────────────────────────────────────────────────────────
 # In binary-release mode, the on-disk copy of this script can lag the
 # repo by several releases (it's only refreshed by re-running install.sh).
@@ -65,31 +97,6 @@ if [ "${SELF_REFRESHED:-0}" != "1" ] && [ "$INSTALL_FROM_RELEASE" = "1" ]; then
             rm -f "$TMP"
         fi
     fi
-fi
-
-# Auto-detect: if no source available, use release binaries
-if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
-    log "No source found — switching to pre-built binary download"
-    INSTALL_FROM_RELEASE=1
-fi
-
-# Auto-detect: if Rust toolchain isn't available, use release binaries.
-# Production VPS installs typically don't have cargo on PATH (and usually
-# don't have enough RAM to compile rustc's dep tree — proc-macro2 OOMs at
-# ~1-2 GB). Fall back to the pre-built artifacts on the matching tag rather
-# than asking the operator to install rustup just to update.
-if [ "$INSTALL_FROM_RELEASE" != "1" ] \
-   && ! command -v cargo > /dev/null 2>&1 \
-   && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
-    log "Rust toolchain not found — switching to pre-built binary download"
-    log "(set BUILD_FROM_SOURCE=1 to force compile-from-source instead)"
-    INSTALL_FROM_RELEASE=1
-fi
-
-# Explicit opt-in to keep compile-from-source behaviour even when cargo
-# is on PATH (e.g. for developers iterating on a checkout).
-if [ "${BUILD_FROM_SOURCE:-0}" = "1" ]; then
-    INSTALL_FROM_RELEASE=0
 fi
 
 # For source builds, verify source exists

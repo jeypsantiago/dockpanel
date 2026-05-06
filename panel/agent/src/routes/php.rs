@@ -117,30 +117,80 @@ async fn install_version(
         }));
     }
 
-    // Ensure ondrej/php PPA is added
-    let ppa_check = safe_command("bash")
-        .args(["-c", "apt-cache policy php8.4-fpm 2>/dev/null | grep -q ondrej || true"])
+    // Ensure php{version}-fpm is available from some apt source. On Debian 13
+    // and Ubuntu 24.04 the requested version may already be in the default
+    // repo. If not, configure a 3rd-party repo: deb.sury.org for Debian,
+    // ppa:ondrej/php for Ubuntu. (Pre-v2.8.16 used Ondrej PPA for both,
+    // which doesn't work on Debian — packages aren't built for trixie.)
+    let pkg_available = safe_command("bash")
+        .args(["-c", &format!("apt-cache show php{version}-fpm 2>/dev/null | grep -q '^Package:'")])
         .output()
-        .await;
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
-    if ppa_check.is_err() {
-        // Try adding PPA. Unsandboxed: writes to /etc/apt/sources.list.d
-        // and /usr via apt-get install software-properties-common.
-        tracing::info!("Adding ondrej/php PPA...");
-        let ppa_result = safe_command_unsandboxed("bash", &[])
-            .args(["-c", "apt-get update -qq && apt-get install -y -qq software-properties-common && add-apt-repository -y ppa:ondrej/php && apt-get update -qq"])
-            .output()
-            .await;
+    if !pkg_available {
+        let osr = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+        let parse = |key: &str| -> String {
+            osr.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key}=")))
+                .map(|v| v.trim_matches('"').to_string())
+                .unwrap_or_default()
+        };
+        let os_id = parse("ID");
+        let codename = parse("VERSION_CODENAME");
 
-        if let Err(e) = ppa_result {
+        let repo_cmd = if os_id == "debian" && !codename.is_empty() {
+            tracing::info!("Adding deb.sury.org repo for Debian ({codename})...");
+            format!(
+                "apt-get update -qq && apt-get install -y -qq apt-transport-https lsb-release ca-certificates curl gnupg && \
+                 curl -sSLo /usr/share/keyrings/deb.sury.org-php.gpg https://packages.sury.org/php/apt.gpg && \
+                 echo 'deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ {codename} main' > /etc/apt/sources.list.d/sury-php.list && \
+                 apt-get update -qq"
+            )
+        } else if os_id == "ubuntu" {
+            tracing::info!("Adding ppa:ondrej/php for Ubuntu...");
+            "apt-get update -qq && apt-get install -y -qq software-properties-common && \
+             add-apt-repository -y ppa:ondrej/php && apt-get update -qq".to_string()
+        } else {
             return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_REQUEST,
                 Json(InstallResponse {
                     success: false,
-                    message: format!("Failed to add PHP PPA: {e}"),
+                    message: format!("Unsupported distro for PHP install: ID='{os_id}'. Install PHP {version} manually."),
                     version: version.to_string(),
                 }),
             ));
+        };
+
+        let repo_result = safe_command_unsandboxed("bash", &[])
+            .args(["-c", &repo_cmd])
+            .output()
+            .await;
+
+        match repo_result {
+            Ok(o) if !o.status.success() => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(InstallResponse {
+                        success: false,
+                        message: format!("Failed to configure PHP repo: {err}"),
+                        version: version.to_string(),
+                    }),
+                ));
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(InstallResponse {
+                        success: false,
+                        message: format!("Failed to configure PHP repo: {e}"),
+                        version: version.to_string(),
+                    }),
+                ));
+            }
+            Ok(_) => {}
         }
     }
 

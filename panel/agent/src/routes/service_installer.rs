@@ -51,8 +51,8 @@ async fn install_status() -> Result<Json<serde_json::Value>, ApiErr> {
     let pdns_installed = is_installed("pdns-server").await;
     let pdns_running = is_active("pdns").await;
 
-    let php_installed = is_installed("php-fpm").await || is_installed("php8.3-fpm").await || is_installed("php8.2-fpm").await || is_installed("php8.1-fpm").await;
-    let php_running = is_active("php8.3-fpm").await || is_active("php8.2-fpm").await || is_active("php8.1-fpm").await;
+    let php_installed = is_installed("php-fpm").await || is_installed("php8.4-fpm").await || is_installed("php8.3-fpm").await || is_installed("php8.2-fpm").await || is_installed("php8.1-fpm").await;
+    let php_running = is_active("php8.4-fpm").await || is_active("php8.3-fpm").await || is_active("php8.2-fpm").await || is_active("php8.1-fpm").await;
     let certbot_installed = which("certbot").await;
     let ufw_installed = which("ufw").await;
     let ufw_active = is_ufw_active().await;

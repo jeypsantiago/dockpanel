@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.16] - 2026-05-06
+
+### Fixed
+
+- **PHP install failed on Debian 13 (trixie)** ([#57](https://github.com/ovexro/dockpanel/issues/57)).
+  `setup.sh` hardcoded `PHP_VER=8.3` and reached for
+  `add-apt-repository -y ppa:ondrej/php` whenever `apt-cache show
+  php8.3` returned nothing — but trixie ships PHP 8.4 in its default
+  repo, and `ppa:ondrej/php` is an Ubuntu PPA that has no packages
+  built for trixie. Fresh Debian 13 installs hit "PHP 8.3 installation
+  failed" and ended up with no PHP at all. New flow: try the
+  default-repo `php-fpm` metapackage first (covers Debian 13/12 and
+  Ubuntu 24.04 cleanly with whatever PHP version each distro ships),
+  fall back to `deb.sury.org` for older Debian or `ppa:ondrej/php`
+  for Ubuntu when the default repo can't satisfy the install. Same
+  Debian-vs-Ubuntu split applied to the panel-driven PHP installer
+  in `panel/agent/src/routes/php.rs` so Settings → Services →
+  Install PHP works on Debian too.
+- **`update.sh` self-refresh never fired on the default code path.**
+  Mode auto-detection (`INSTALL_FROM_RELEASE=1` when no Rust toolchain
+  / no source) ran *after* the self-refresh check, so a user running
+  plain `bash /opt/dockpanel/scripts/update.sh` entered with
+  `INSTALL_FROM_RELEASE=0`, failed the self-refresh gate, and then
+  got bumped to `1` by auto-detect — but with the stale local script
+  still executing. Effect: pre-v2.8.16 panels swapped binaries to the
+  latest release just fine, but never picked up script-side fixes
+  (unit-file deploys, nginx config tweaks, install-agent.sh drop into
+  FE_DIST). That's why issue [#56](https://github.com/ovexro/dockpanel/issues/56)
+  resurfaced after the v2.8.14 fix shipped — operators on v2.8.13
+  ran update.sh and stayed on v2.8.13's update.sh logic. Fix: move
+  mode detection ahead of the self-refresh block so
+  `INSTALL_FROM_RELEASE` is correct by the time the gate evaluates.
+  Operators on v2.8.13/v2.8.14/v2.8.15 should run
+  `INSTALL_FROM_RELEASE=1 bash /opt/dockpanel/scripts/update.sh` once
+  to trigger self-refresh; from v2.8.16 onward, plain `bash update.sh`
+  works.
+- **PHP 8.4 not detected as installed.**
+  `panel/agent/src/routes/service_installer.rs` enumerated
+  `php8.{1,2,3}-fpm` to determine if PHP was installed/running, so a
+  Debian 13 install (which lands PHP 8.4 from the default repo) was
+  reported as "PHP not installed" in Settings → Services even when
+  it was running fine. Added `php8.4-fpm` to both checks.
+
 ## [2.8.15] - 2026-05-06
 
 ### Fixed
