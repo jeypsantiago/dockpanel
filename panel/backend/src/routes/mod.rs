@@ -864,6 +864,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/alerts/{id}/resolve", put(alerts::resolve))
         .route("/api/alert-rules", get(alerts::get_rules).put(alerts::update_rules))
         .route("/api/alert-rules/{server_id}", put(alerts::update_server_rules).delete(alerts::delete_server_rules))
+        // Alert Runbooks (Phase 4 W2)
+        .route("/api/alerts/runbooks", get(alerts::list_runbooks_route))
+        .route("/api/alerts/runbooks/apply-defaults", post(alerts::apply_defaults))
+        .route("/api/alerts/runbooks/{alert_type}", get(alerts::get_runbook_route).put(alerts::put_runbook).delete(alerts::delete_runbook))
         // Notification Center
         .route("/api/notifications", get(notifications::list))
         .route("/api/notifications/unread-count", get(notifications::unread_count))

@@ -1,6 +1,6 @@
 [package]
 name = "dockpanel-api"
-version = "2.8.17"
+version = "2.8.18"
 edition = "2024"
 
 [profile.release]
@@ -49,3 +49,5 @@ url = "2"
 serde_yaml_ng = "0.10"
 hkdf = "0.12"
 zeroize = { version = "1", features = ["derive"] }
+# Phase 4 W2: render runbook markdown into HTML for email payloads.
+pulldown-cmark = { version = "0.10", default-features = false, features = ["html"] }

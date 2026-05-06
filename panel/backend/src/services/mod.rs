@@ -1,6 +1,8 @@
 pub mod activity;
 pub mod agent;
 pub mod alert_engine;
+pub mod alert_runbook_defaults;
+pub mod alert_runbooks;
 pub mod auto_healer;
 pub mod backup_policy_executor;
 pub mod backup_scheduler;

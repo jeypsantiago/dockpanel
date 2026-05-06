@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.18] - 2026-05-06
+
+### Added
+
+- **Phase 4 W2: Alert runbooks attached to fired alerts.** Markdown text per
+  alert type, indexed by `alert_type`. Excerpts (280 char, truncated at
+  sentence boundary) ride along in slack/discord/pagerduty/webhook payloads;
+  full markdown is rendered into email HTML and into the new Alerts page row
+  expansion. Operator-edited runbooks survive panel upgrades by construction
+  (`apply-defaults` uses `ON CONFLICT DO NOTHING` and never overwrites edits).
+  Resolution is DB-row-then-default — fresh installs produce useful payloads
+  from the compile-time const slice without the operator having to seed first.
+- **15 default runbooks** shipped with the panel (`panel/backend/runbooks/`):
+  5 critical (offline / service_down / container_crashloop / backup_failure /
+  gpu_temperature), 9 warning (cpu / memory / disk / disk_forecast / ssl_expiry
+  / container_unhealthy / gpu_utilization / gpu_vram / memory_leak), 1 info
+  (container_down). Each follows the same shape: Why this fired → First check
+  → Common causes → Escalation. Authored for paging-grade discipline (info
+  alerts won't wake anyone, critical ones page clearly).
+- **`Alerts → Runbooks` tab** with per-type list, edit modal (split textarea +
+  live markdown preview, severity selector, Restore-default button), and
+  "Seed missing default runbooks" action with insert-or-skip confirmation.
+- **Inline runbook expansion on each fired alert** — click any row in the
+  Alerts list, the runbook for that alert type is fetched and rendered
+  below the alert detail. Targets the W2 acceptance bar: an admin paged at
+  3am sees the runbook in the page, not as a "go look at our wiki" link.
+- **5 admin-only API endpoints** under `/api/alerts/runbooks`:
+  `GET` (list with `is_default` flag), `GET {alert_type}` (single),
+  `PUT {alert_type}` (upsert, 50KB cap, severity validated), `DELETE`
+  (restore default by removing DB row), `POST apply-defaults`
+  (insert-or-skip from const slice, returns `{ inserted, skipped }`).
+
+### Changed
+
+- `services/notifications.rs::try_fire_alert` now resolves a runbook by
+  `alert_type` and threads `runbook_excerpt` + `runbook_url` through a new
+  `send_notification_with_runbook` helper (the existing `send_notification`
+  is unchanged, so the 14 non-alert callers across auto_healer, uptime,
+  security_hardening, git_deploys, and incidents stay on the original API).
+  Email gets full pulldown-cmark-rendered HTML appended to the body, slack
+  and discord get a link plus excerpt, pagerduty extends `custom_details`,
+  generic webhook adds `runbook_url` + `runbook_excerpt` as top-level keys.
+- New backend dep: `pulldown-cmark = "0.10"` (no_std-capable, ~50KB binary
+  impact, fuzz-tested upstream; rendered output wrapped in `catch_unwind`
+  defensively with HTML-escape fallback).
+- New frontend deps: `marked@^14` + `dompurify@^3` (~51KB gzipped combined).
+  DOMPurify is non-negotiable defense-in-depth — runbook markdown is
+  admin-authored but stored in DB and editable via API.
+- Email template variables now include `{{runbook_excerpt}}` and
+  `{{runbook_url}}` alongside the existing `{{title}}`/`{{message}}`/
+  `{{severity}}`/`{{timestamp}}`. Backwards-compatible: existing custom
+  templates ignore unknown placeholders.
+- Migration `20260507000000_alert_runbooks.sql` adds the table:
+  `alert_runbooks(alert_type TEXT PK, runbook_md TEXT, severity_default
+  TEXT CHECK (info|warning|critical), updated_by UUID FK users(id) ON
+  DELETE SET NULL, updated_at TIMESTAMPTZ)`.
+
 ## [2.8.17] - 2026-05-06
 
 ### Fixed
