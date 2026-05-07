@@ -465,6 +465,11 @@ if [ -d /etc/nginx/sites-enabled ]; then
             log "Normalized explicit IPv4 HTTPS listener in $site_conf for server_name routing"
             NGINX_NEEDS_RELOAD=1
         fi
+        if grep -qE '^[[:space:]]*listen[[:space:]]+[0-9.]+:80;[[:space:]]*$' "$site_conf"; then
+            sed -i -E 's|^([[:space:]]*)listen[[:space:]]+[0-9.]+:80;[[:space:]]*$|\1listen 80;|' "$site_conf"
+            log "Normalized explicit IPv4 HTTP listener in $site_conf for server_name routing"
+            NGINX_NEEDS_RELOAD=1
+        fi
     done
 fi
 ensure_panel_https_fallback
