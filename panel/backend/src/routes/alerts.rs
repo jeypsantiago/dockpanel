@@ -5,8 +5,10 @@ use axum::{
 };
 use uuid::Uuid;
 
-use crate::auth::{AuthUser, ServerScope};
+use crate::auth::{AdminUser, AuthUser, ServerScope};
 use crate::error::{internal_error, err, ApiError};
+use crate::services::alert_runbook_defaults::DEFAULTS;
+use crate::services::alert_runbooks::{get_runbook, list_runbooks, RunbookView};
 use crate::AppState;
 
 #[derive(serde::Deserialize)]
@@ -416,4 +418,152 @@ pub async fn delete_server_rules(
     .map_err(|e| internal_error("delete server rules", e))?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// Runbooks (Phase 4 W2)
+//
+// Markdown-per-alert-type, attached to fired alerts and rendered into
+// notification payloads. Admin-only. Resolution is DB-row-then-default —
+// fresh installs still produce useful payloads from the const slice without
+// the operator having to click "Seed missing default runbooks" first.
+// ---------------------------------------------------------------------------
+
+const RUNBOOK_MD_MAX_BYTES: usize = 50 * 1024;
+
+#[derive(serde::Deserialize)]
+pub struct RunbookUpsert {
+    pub runbook_md: String,
+    pub severity_default: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ApplyDefaultsResponse {
+    pub inserted: Vec<String>,
+    pub skipped: Vec<String>,
+}
+
+/// GET /api/alerts/runbooks — List every known runbook.
+/// Returns the union of DB rows and compile-time defaults; defaults that have
+/// no DB row yet are flagged `is_default = true`.
+pub async fn list_runbooks_route(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+) -> Result<Json<Vec<RunbookView>>, ApiError> {
+    Ok(Json(list_runbooks(&state.db).await))
+}
+
+/// GET /api/alerts/runbooks/{alert_type} — Single runbook with `is_default` flag.
+pub async fn get_runbook_route(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    Path(alert_type): Path<String>,
+) -> Result<Json<RunbookView>, ApiError> {
+    match get_runbook(&state.db, &alert_type).await {
+        Some(r) => Ok(Json(r)),
+        None => Err(err(StatusCode::NOT_FOUND, "no runbook for alert_type")),
+    }
+}
+
+/// PUT /api/alerts/runbooks/{alert_type} — Upsert. Sets updated_by from auth.
+pub async fn put_runbook(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    Path(alert_type): Path<String>,
+    Json(body): Json<RunbookUpsert>,
+) -> Result<Json<RunbookView>, ApiError> {
+    if body.runbook_md.len() > RUNBOOK_MD_MAX_BYTES {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "runbook_md exceeds 50KB",
+        ));
+    }
+    if !matches!(
+        body.severity_default.as_str(),
+        "info" | "warning" | "critical"
+    ) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "severity_default must be info, warning, or critical",
+        ));
+    }
+    if alert_type.is_empty() || alert_type.len() > 64 {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid alert_type"));
+    }
+
+    sqlx::query(
+        "INSERT INTO alert_runbooks (alert_type, runbook_md, severity_default, updated_by, updated_at) \
+         VALUES ($1, $2, $3, $4, NOW()) \
+         ON CONFLICT (alert_type) DO UPDATE SET \
+           runbook_md = EXCLUDED.runbook_md, \
+           severity_default = EXCLUDED.severity_default, \
+           updated_by = EXCLUDED.updated_by, \
+           updated_at = NOW()",
+    )
+    .bind(&alert_type)
+    .bind(&body.runbook_md)
+    .bind(&body.severity_default)
+    .bind(claims.sub)
+    .execute(&state.db)
+    .await
+    .map_err(|e| internal_error("upsert runbook", e))?;
+
+    match get_runbook(&state.db, &alert_type).await {
+        Some(r) => Ok(Json(r)),
+        None => Err(internal_error(
+            "read-back runbook after upsert",
+            "missing row",
+        )),
+    }
+}
+
+/// DELETE /api/alerts/runbooks/{alert_type} — Remove DB row → next read falls back to default.
+pub async fn delete_runbook(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    Path(alert_type): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let res = sqlx::query("DELETE FROM alert_runbooks WHERE alert_type = $1")
+        .bind(&alert_type)
+        .execute(&state.db)
+        .await
+        .map_err(|e| internal_error("delete runbook", e))?;
+
+    Ok(Json(serde_json::json!({
+        "deleted": res.rows_affected() > 0,
+        "alert_type": alert_type,
+    })))
+}
+
+/// POST /api/alerts/runbooks/apply-defaults — Insert-or-skip from const slice.
+/// **Never overwrites operator edits** (ON CONFLICT DO NOTHING).
+pub async fn apply_defaults(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+) -> Result<Json<ApplyDefaultsResponse>, ApiError> {
+    let mut inserted = Vec::new();
+    let mut skipped = Vec::new();
+
+    for d in DEFAULTS {
+        let res = sqlx::query(
+            "INSERT INTO alert_runbooks (alert_type, runbook_md, severity_default, updated_by, updated_at) \
+             VALUES ($1, $2, $3, $4, NOW()) \
+             ON CONFLICT (alert_type) DO NOTHING",
+        )
+        .bind(d.alert_type)
+        .bind(d.runbook_md)
+        .bind(d.severity)
+        .bind(claims.sub)
+        .execute(&state.db)
+        .await
+        .map_err(|e| internal_error("apply runbook defaults", e))?;
+
+        if res.rows_affected() == 1 {
+            inserted.push(d.alert_type.to_string());
+        } else {
+            skipped.push(d.alert_type.to_string());
+        }
+    }
+
+    Ok(Json(ApplyDefaultsResponse { inserted, skipped }))
 }

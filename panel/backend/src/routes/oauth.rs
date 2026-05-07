@@ -99,6 +99,7 @@ pub async fn authorize(
 pub async fn callback(
     State(state): State<AppState>,
     Path(provider_name): Path<String>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, ApiError> {
     // Check for OAuth error response from provider
@@ -341,8 +342,16 @@ pub async fn callback(
         Some("user"), Some(&provider_name), None, None,
     ).await;
 
-    // Set cookie and redirect to dashboard
-    let secure_flag = if state.config.base_url.starts_with("https") { "; Secure" } else { "" };
+    // Set cookie and redirect to dashboard.
+    // Browsers reject Secure cookies on HTTP — only set Secure when the request
+    // arrived over HTTPS (#47, v2.8.14).
+    let secure_flag = if state.config.base_url.starts_with("https")
+        || crate::routes::auth::request_is_https(&headers)
+    {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
         "token={token}; HttpOnly{secure_flag}; SameSite=Lax; Path=/; Max-Age=7200"
     );

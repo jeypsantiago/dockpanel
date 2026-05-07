@@ -181,6 +181,227 @@ pub async fn send_notification(
     }
 }
 
+/// Resolve panel base URL from settings → env → fallback.
+/// Used to build "Open runbook" links in notification payloads.
+async fn panel_base_url(pool: &PgPool) -> String {
+    if let Ok(Some((url,))) = sqlx::query_as::<_, (String,)>(
+        "SELECT value FROM settings WHERE key = 'base_url'",
+    )
+    .fetch_optional(pool)
+    .await
+    {
+        if !url.is_empty() {
+            return url.trim_end_matches('/').to_string();
+        }
+    }
+    std::env::var("BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_default()
+}
+
+/// Phase 4 W2: Send a notification with runbook attachment.
+/// Used by `try_fire_alert` — non-alert callers stay on `send_notification`.
+///
+/// Per-channel handling:
+/// - email: full markdown rendered via pulldown-cmark, appended to body_html
+/// - slack/discord: link + 280-char excerpt appended to message
+/// - pagerduty: runbook_url + runbook_excerpt added to custom_details
+/// - webhook: runbook_url + runbook_excerpt as top-level keys
+async fn send_notification_with_runbook(
+    pool: &PgPool,
+    channels: &NotifyChannels,
+    subject: &str,
+    message: &str,
+    body_html: &str,
+    runbook_excerpt: Option<&str>,
+    runbook_url: Option<&str>,
+) {
+    let client = http_client();
+    let severity = derive_severity(subject);
+
+    // Email — appends rendered runbook HTML to body_html.
+    if let Some(ref email) = channels.email {
+        let email_template: Option<(String,)> = sqlx::query_as(
+            "SELECT value FROM settings WHERE key = 'notif_template_email'",
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+        let runbook_html = runbook_excerpt
+            .map(|md| render_runbook_html(md))
+            .unwrap_or_default();
+        let runbook_url_str = runbook_url.unwrap_or("");
+
+        let html = if let Some((tmpl,)) = email_template {
+            if !tmpl.is_empty() {
+                tmpl.replace("{{title}}", subject)
+                    .replace("{{message}}", message)
+                    .replace("{{severity}}", severity)
+                    .replace("{{timestamp}}", &chrono::Utc::now().to_rfc3339())
+                    .replace("{{runbook_excerpt}}", &runbook_html)
+                    .replace("{{runbook_url}}", runbook_url_str)
+            } else {
+                append_runbook_to_html(body_html, &runbook_html, runbook_url_str)
+            }
+        } else {
+            append_runbook_to_html(body_html, &runbook_html, runbook_url_str)
+        };
+
+        if let Err(e) = crate::services::email::send_email(pool, email, subject, &html).await {
+            tracing::warn!("Alert email failed: {e}");
+        }
+    }
+
+    // Slack — append `*Runbook:* <url|view>\n_excerpt_` to message.
+    if let Some(ref url) = channels.slack_url {
+        if !url.is_empty() {
+            let mut text = format_message(pool, "slack", subject, message, severity).await;
+            if let Some(excerpt) = runbook_excerpt {
+                if let Some(rurl) = runbook_url {
+                    text.push_str(&format!("\n\n*Runbook:* <{rurl}|view>\n_{excerpt}_"));
+                } else {
+                    text.push_str(&format!("\n\n*Runbook:* _{excerpt}_"));
+                }
+            }
+            let _ = client
+                .post(url)
+                .json(&serde_json::json!({ "text": text }))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+        }
+    }
+
+    // Discord — append **Runbook:** [view](url)\n*excerpt*
+    if let Some(ref url) = channels.discord_url {
+        if !url.is_empty() {
+            let mut content = format_message(pool, "discord", subject, message, severity).await;
+            if let Some(excerpt) = runbook_excerpt {
+                if let Some(rurl) = runbook_url {
+                    content.push_str(&format!("\n\n**Runbook:** [view]({rurl})\n*{excerpt}*"));
+                } else {
+                    content.push_str(&format!("\n\n**Runbook:** *{excerpt}*"));
+                }
+            }
+            let _ = client
+                .post(url)
+                .json(&serde_json::json!({ "content": content }))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+        }
+    }
+
+    // PagerDuty — extend custom_details with runbook fields.
+    if let Some(ref key) = channels.pagerduty_key {
+        if !key.is_empty() {
+            let event_action = if subject.contains("Resolved") || subject.contains("back up") {
+                "resolve"
+            } else {
+                "trigger"
+            };
+            let mut custom_details = serde_json::json!({ "message": message });
+            if let Some(excerpt) = runbook_excerpt {
+                custom_details["runbook_excerpt"] = serde_json::json!(excerpt);
+            }
+            if let Some(rurl) = runbook_url {
+                custom_details["runbook_url"] = serde_json::json!(rurl);
+            }
+            let _ = client
+                .post("https://events.pagerduty.com/v2/enqueue")
+                .json(&serde_json::json!({
+                    "routing_key": key,
+                    "event_action": event_action,
+                    "payload": {
+                        "summary": subject,
+                        "source": "DockPanel",
+                        "severity": severity,
+                        "custom_details": custom_details,
+                    },
+                }))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+        }
+    }
+
+    // Generic webhook — top-level runbook keys.
+    if let Some(ref url) = channels.webhook_url {
+        if !url.is_empty() {
+            let custom_message = format_message(pool, "webhook", subject, message, severity).await;
+            let mut payload = serde_json::json!({
+                "title": subject,
+                "message": custom_message,
+                "severity": severity,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "source": "dockpanel",
+            });
+            if let Some(excerpt) = runbook_excerpt {
+                payload["runbook_excerpt"] = serde_json::json!(excerpt);
+            }
+            if let Some(rurl) = runbook_url {
+                payload["runbook_url"] = serde_json::json!(rurl);
+            }
+            let _ = client
+                .post(url)
+                .json(&payload)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+        }
+    }
+}
+
+/// Render markdown to safe HTML using pulldown-cmark. Wrapped in catch_unwind
+/// defensively — admin-authored input is trusted but the parser is third-party.
+fn render_runbook_html(md: &str) -> String {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let parser = pulldown_cmark::Parser::new(md);
+        let mut html = String::with_capacity(md.len() * 2);
+        pulldown_cmark::html::push_html(&mut html, parser);
+        html
+    }));
+    match result {
+        Ok(html) => html,
+        Err(_) => {
+            tracing::warn!("pulldown-cmark panicked rendering runbook; falling back to raw text");
+            html_escape(md)
+        }
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn append_runbook_to_html(body_html: &str, runbook_html: &str, runbook_url: &str) -> String {
+    if runbook_html.is_empty() {
+        return body_html.to_string();
+    }
+    let link = if runbook_url.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p style=\"margin:16px 0 8px\"><a href=\"{runbook_url}\" \
+             style=\"color:#3b82f6;text-decoration:none;font-weight:600\">Open runbook in panel →</a></p>"
+        )
+    };
+    format!(
+        "{body_html}\
+         <hr style=\"margin:24px 0;border:none;border-top:1px solid #e5e7eb\"/>\
+         <h3 style=\"font-family:sans-serif;color:#111827;margin:0 0 12px\">Runbook</h3>\
+         <div style=\"font-family:sans-serif;color:#374151;line-height:1.5\">{runbook_html}</div>\
+         {link}"
+    )
+}
+
 /// Get notification channels for a user from their alert_rules.
 /// Checks server-specific rules first, falls back to global (server_id IS NULL).
 pub async fn get_user_channels(
@@ -472,7 +693,35 @@ pub async fn try_fire_alert(
                 },
                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
             );
-            send_notification(pool, &channels, &subject, message, &html).await;
+
+            // Phase 4 W2: attach runbook to the notification payload.
+            // Excerpt goes to slack/discord/pagerduty/webhook + email body.
+            // URL is built from base_url setting; falls back to empty if unset.
+            let runbook = crate::services::alert_runbooks::get_runbook(pool, alert_type).await;
+            let runbook_excerpt = runbook
+                .as_ref()
+                .map(|r| crate::services::alert_runbooks::excerpt(&r.runbook_md, 280));
+            let runbook_url = if runbook.is_some() {
+                let base = panel_base_url(pool).await;
+                if base.is_empty() {
+                    None
+                } else {
+                    Some(format!("{base}/alerts/runbooks/{alert_type}"))
+                }
+            } else {
+                None
+            };
+
+            send_notification_with_runbook(
+                pool,
+                &channels,
+                &subject,
+                message,
+                &html,
+                runbook_excerpt.as_deref(),
+                runbook_url.as_deref(),
+            )
+            .await;
         } else {
             tracing::debug!("Alert type '{alert_type}' is muted — skipping external channels");
         }

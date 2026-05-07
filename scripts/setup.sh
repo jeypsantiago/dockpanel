@@ -115,6 +115,15 @@ preflight_checks() {
 detect_pkg_manager() {
     if command -v apt-get &> /dev/null; then
         PKG_MGR="apt"
+        # Tell apt to wait up to 5 min for the dpkg lock instead of failing
+        # immediately. Without this, agent installers (PHP, services, updates)
+        # fail with "Could not get lock /var/lib/dpkg/lock-frontend" whenever
+        # unattended-upgrades is running in the background — common on fresh
+        # Debian 13 boots, where the auto-update kicks off right after install.
+        mkdir -p /etc/apt/apt.conf.d
+        cat > /etc/apt/apt.conf.d/99-dockpanel-lock-wait.conf << 'APT_EOF'
+DPkg::Lock::Timeout "300";
+APT_EOF
     elif command -v dnf &> /dev/null; then
         PKG_MGR="dnf"
     elif command -v yum &> /dev/null; then
@@ -349,6 +358,7 @@ create_directories() {
     mkdir -p /var/lib/nginx /etc/letsencrypt /var/lib/dpkg /var/cache/apt /var/lib/apt
     mkdir -p /etc/php /var/spool/cron /var/lib/dockpanel/git /var/lib/dockpanel/recordings
     mkdir -p /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns
+    mkdir -p /var/cache/nginx/fastcgi
     touch /etc/opendkim.conf /run/nginx.pid 2>/dev/null || true
 
     log "Directories created"
@@ -786,6 +796,15 @@ configure_nginx() {
         FE_ROOT="${FRONTEND_DIR}/dist"
     fi
 
+    # Drop install-agent.sh into FE_ROOT so the panel's SPA-fallback nginx config
+    # serves it via `try_files $uri` (instead of returning the SPA index.html).
+    # Backend at panel/backend/src/routes/servers.rs prints `curl … {panel_url}/install-agent.sh`
+    # in the multi-server install command — this is what makes that URL resolve. (#56, v2.8.14)
+    if [ -f "$REPO_DIR/scripts/install-agent.sh" ] && [ -d "$FE_ROOT" ]; then
+        cp "$REPO_DIR/scripts/install-agent.sh" "$FE_ROOT/install-agent.sh"
+        chmod 644 "$FE_ROOT/install-agent.sh"
+    fi
+
     local SERVER_NAME="_"
     local LISTEN_DIRECTIVE="listen ${PANEL_PORT};"
     if [ -n "$PANEL_DOMAIN" ]; then
@@ -926,22 +945,60 @@ install_recommended_services() {
     # PHP-FPM (needed for WordPress, PHP sites)
     if ! command -v php &> /dev/null; then
         log "Installing PHP-FPM..."
-        local PHP_VER="8.3"
         if [ "$PKG_MGR" = "apt" ]; then
-            # Add ondrej PPA for PHP 8.3 on older distros
-            if ! apt-cache show php8.3 > /dev/null 2>&1; then
-                apt-get install -y software-properties-common > /dev/null 2>&1
-                add-apt-repository -y ppa:ondrej/php > /dev/null 2>&1 || true
-                apt-get update -y > /dev/null 2>&1
+            # Re-source /etc/os-release — detect_os' copy is local to that function.
+            local OS_ID="" OS_CODENAME=""
+            if [ -f /etc/os-release ]; then
+                OS_ID=$(. /etc/os-release && echo "${ID:-}")
+                OS_CODENAME=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
             fi
-            if apt-get install -y php${PHP_VER}-fpm php${PHP_VER}-cli php${PHP_VER}-mysql \
-                php${PHP_VER}-pgsql php${PHP_VER}-curl php${PHP_VER}-gd php${PHP_VER}-mbstring \
-                php${PHP_VER}-xml php${PHP_VER}-zip php${PHP_VER}-bcmath php${PHP_VER}-intl \
-                php${PHP_VER}-readline php${PHP_VER}-opcache > /dev/null 2>&1; then
+
+            # Step 1: try default-repo php-fpm. Covers Debian 13/12 (PHP 8.4/8.2),
+            # Ubuntu 24.04 (PHP 8.3) — modern distros ship a usable PHP out of
+            # the box and don't need a 3rd-party repo at all.
+            local PHP_VER=""
+            if apt-cache show php-fpm > /dev/null 2>&1 \
+                && apt-get install -y php-fpm php-cli php-mysql php-pgsql php-curl \
+                    php-gd php-mbstring php-xml php-zip php-bcmath php-intl \
+                    php-readline php-opcache > /dev/null 2>&1; then
+                PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)
+            fi
+
+            # Step 2: fall back to a 3rd-party repo for PHP 8.3 if step 1 didn't
+            # land us on a usable PHP. Debian → deb.sury.org; Ubuntu → ppa:ondrej/php.
+            # The previous releases hardcoded the Ondrej PPA for both, which doesn't
+            # work on Debian — that's why fresh Debian 13 installs were warning
+            # "PHP 8.3 installation failed" (#57).
+            if [ -z "$PHP_VER" ]; then
+                PHP_VER="8.3"
+                if [ "$OS_ID" = "debian" ] && [ -n "$OS_CODENAME" ]; then
+                    log "Adding deb.sury.org repo for PHP ${PHP_VER}..."
+                    apt-get install -y apt-transport-https lsb-release ca-certificates curl gnupg > /dev/null 2>&1
+                    curl -sSLo /usr/share/keyrings/deb.sury.org-php.gpg https://packages.sury.org/php/apt.gpg 2>/dev/null
+                    echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ ${OS_CODENAME} main" \
+                        > /etc/apt/sources.list.d/sury-php.list
+                    apt-get update -y > /dev/null 2>&1
+                elif [ "$OS_ID" = "ubuntu" ]; then
+                    log "Adding ppa:ondrej/php for PHP ${PHP_VER}..."
+                    apt-get install -y software-properties-common > /dev/null 2>&1
+                    add-apt-repository -y ppa:ondrej/php > /dev/null 2>&1 || true
+                    apt-get update -y > /dev/null 2>&1
+                fi
+
+                if apt-get install -y php${PHP_VER}-fpm php${PHP_VER}-cli php${PHP_VER}-mysql \
+                    php${PHP_VER}-pgsql php${PHP_VER}-curl php${PHP_VER}-gd php${PHP_VER}-mbstring \
+                    php${PHP_VER}-xml php${PHP_VER}-zip php${PHP_VER}-bcmath php${PHP_VER}-intl \
+                    php${PHP_VER}-readline php${PHP_VER}-opcache > /dev/null 2>&1; then
+                    : # PHP_VER is already set
+                else
+                    warn "PHP ${PHP_VER} installation failed — install manually later from Settings → Services"
+                    PHP_VER=""
+                fi
+            fi
+
+            if [ -n "$PHP_VER" ]; then
                 systemctl enable --now php${PHP_VER}-fpm > /dev/null 2>&1
                 log "PHP ${PHP_VER} installed with FPM"
-            else
-                warn "PHP ${PHP_VER} installation failed — install manually later from Settings → Services"
             fi
         else
             # RHEL/Rocky/Fedora

@@ -1496,3 +1496,21 @@ tr.table-row-hover:hover {
     scroll-behavior: auto !important;
   }
 }
+
+/* Phase 4 W2: minimal styling for rendered runbook markdown.
+   Keeps the panel theme without pulling a full prose framework. */
+.markdown-body h1 { font-size: 1.125rem; font-weight: 600; margin: 1rem 0 0.5rem; color: var(--color-dark-50, #f1f5f9); }
+.markdown-body h2 { font-size: 1rem; font-weight: 600; margin: 1rem 0 0.5rem; color: var(--color-dark-50, #f1f5f9); }
+.markdown-body h3 { font-size: 0.95rem; font-weight: 600; margin: 0.875rem 0 0.5rem; color: var(--color-dark-50, #f1f5f9); }
+.markdown-body p { margin: 0.5rem 0; line-height: 1.55; }
+.markdown-body ul, .markdown-body ol { margin: 0.5rem 0; padding-left: 1.5rem; }
+.markdown-body ul { list-style: disc; }
+.markdown-body ol { list-style: decimal; }
+.markdown-body li { margin: 0.2rem 0; }
+.markdown-body code { background: rgba(0,0,0,0.3); padding: 0.1rem 0.35rem; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 0.85em; }
+.markdown-body pre { background: rgba(0,0,0,0.3); padding: 0.75rem; border-radius: 6px; overflow-x: auto; margin: 0.75rem 0; }
+.markdown-body pre code { background: transparent; padding: 0; }
+.markdown-body a { color: #60a5fa; text-decoration: underline; }
+.markdown-body strong { font-weight: 600; color: var(--color-dark-50, #f1f5f9); }
+.markdown-body hr { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 1rem 0; }
+.markdown-body blockquote { border-left: 3px solid rgba(255,255,255,0.15); padding-left: 0.75rem; margin: 0.75rem 0; color: rgba(255,255,255,0.7); }

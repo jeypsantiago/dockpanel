@@ -6,6 +6,265 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.18] - 2026-05-06
+
+### Added
+
+- **Phase 4 W2: Alert runbooks attached to fired alerts.** Markdown text per
+  alert type, indexed by `alert_type`. Excerpts (280 char, truncated at
+  sentence boundary) ride along in slack/discord/pagerduty/webhook payloads;
+  full markdown is rendered into email HTML and into the new Alerts page row
+  expansion. Operator-edited runbooks survive panel upgrades by construction
+  (`apply-defaults` uses `ON CONFLICT DO NOTHING` and never overwrites edits).
+  Resolution is DB-row-then-default — fresh installs produce useful payloads
+  from the compile-time const slice without the operator having to seed first.
+- **15 default runbooks** shipped with the panel (`panel/backend/runbooks/`):
+  5 critical (offline / service_down / container_crashloop / backup_failure /
+  gpu_temperature), 9 warning (cpu / memory / disk / disk_forecast / ssl_expiry
+  / container_unhealthy / gpu_utilization / gpu_vram / memory_leak), 1 info
+  (container_down). Each follows the same shape: Why this fired → First check
+  → Common causes → Escalation. Authored for paging-grade discipline (info
+  alerts won't wake anyone, critical ones page clearly).
+- **`Alerts → Runbooks` tab** with per-type list, edit modal (split textarea +
+  live markdown preview, severity selector, Restore-default button), and
+  "Seed missing default runbooks" action with insert-or-skip confirmation.
+- **Inline runbook expansion on each fired alert** — click any row in the
+  Alerts list, the runbook for that alert type is fetched and rendered
+  below the alert detail. Targets the W2 acceptance bar: an admin paged at
+  3am sees the runbook in the page, not as a "go look at our wiki" link.
+- **5 admin-only API endpoints** under `/api/alerts/runbooks`:
+  `GET` (list with `is_default` flag), `GET {alert_type}` (single),
+  `PUT {alert_type}` (upsert, 50KB cap, severity validated), `DELETE`
+  (restore default by removing DB row), `POST apply-defaults`
+  (insert-or-skip from const slice, returns `{ inserted, skipped }`).
+
+### Changed
+
+- `services/notifications.rs::try_fire_alert` now resolves a runbook by
+  `alert_type` and threads `runbook_excerpt` + `runbook_url` through a new
+  `send_notification_with_runbook` helper (the existing `send_notification`
+  is unchanged, so the 14 non-alert callers across auto_healer, uptime,
+  security_hardening, git_deploys, and incidents stay on the original API).
+  Email gets full pulldown-cmark-rendered HTML appended to the body, slack
+  and discord get a link plus excerpt, pagerduty extends `custom_details`,
+  generic webhook adds `runbook_url` + `runbook_excerpt` as top-level keys.
+- New backend dep: `pulldown-cmark = "0.10"` (no_std-capable, ~50KB binary
+  impact, fuzz-tested upstream; rendered output wrapped in `catch_unwind`
+  defensively with HTML-escape fallback).
+- New frontend deps: `marked@^14` + `dompurify@^3` (~51KB gzipped combined).
+  DOMPurify is non-negotiable defense-in-depth — runbook markdown is
+  admin-authored but stored in DB and editable via API.
+- Email template variables now include `{{runbook_excerpt}}` and
+  `{{runbook_url}}` alongside the existing `{{title}}`/`{{message}}`/
+  `{{severity}}`/`{{timestamp}}`. Backwards-compatible: existing custom
+  templates ignore unknown placeholders.
+- Migration `20260507000000_alert_runbooks.sql` adds the table:
+  `alert_runbooks(alert_type TEXT PK, runbook_md TEXT, severity_default
+  TEXT CHECK (info|warning|critical), updated_by UUID FK users(id) ON
+  DELETE SET NULL, updated_at TIMESTAMPTZ)`.
+
+## [2.8.17] - 2026-05-06
+
+### Fixed
+
+- **Agent installers failed with `Could not get lock /var/lib/dpkg/lock-frontend`
+  when another apt was running** ([#57 follow-up](https://github.com/ovexro/dockpanel/issues/57)).
+  On fresh Debian 13 boots, `unattended-upgrades` runs in the
+  background and holds the dpkg frontend lock for several minutes.
+  The panel UI's `Install PHP 8.4` (and any other agent-driven apt
+  install/purge — services, updates) failed immediately on contention
+  instead of waiting. Both `setup.sh` (fresh installs) and `update.sh`
+  (existing operators) now drop
+  `/etc/apt/apt.conf.d/99-dockpanel-lock-wait.conf` setting
+  `DPkg::Lock::Timeout "300";` — every apt invocation on the system
+  (agent and otherwise) now waits up to 5 minutes for the dpkg lock
+  before giving up. No agent code change needed; the config file is
+  read fresh on every apt run. Verified end-to-end on Debian 13
+  Trixie: `python3 fcntl.lockf` holding the dpkg lock for 15 s →
+  `apt-get install` waits 15 s and succeeds (vs. 0 s fail-fast pre-fix).
+- **Settings → Services → `Install Redis` (and Node.js, Composer, WAF,
+  Cloudflare Tunnel) returned 404** ([#57 follow-up](https://github.com/ovexro/dockpanel/issues/57)).
+  Latent backend gap since these services were added: the agent has
+  full install/uninstall implementations in
+  `panel/agent/src/routes/service_installer.rs`, but the backend's
+  `routes/mod.rs` only proxied install for php/certbot/ufw/fail2ban/
+  powerdns. Frontend POST to `/api/services/install/redis` (and the
+  other four) hit a non-existent route and returned 404 before
+  reaching the agent. Added the 5 missing install handlers + the 2
+  missing uninstall handlers (waf, cloudflared) in
+  `panel/backend/src/routes/system.rs` and registered all 7 routes in
+  `routes/mod.rs`. Each handler is a 5-line proxy mirroring the
+  existing pattern.
+
+## [2.8.16] - 2026-05-06
+
+### Fixed
+
+- **PHP install failed on Debian 13 (trixie)** ([#57](https://github.com/ovexro/dockpanel/issues/57)).
+  `setup.sh` hardcoded `PHP_VER=8.3` and reached for
+  `add-apt-repository -y ppa:ondrej/php` whenever `apt-cache show
+  php8.3` returned nothing — but trixie ships PHP 8.4 in its default
+  repo, and `ppa:ondrej/php` is an Ubuntu PPA that has no packages
+  built for trixie. Fresh Debian 13 installs hit "PHP 8.3 installation
+  failed" and ended up with no PHP at all. New flow: try the
+  default-repo `php-fpm` metapackage first (covers Debian 13/12 and
+  Ubuntu 24.04 cleanly with whatever PHP version each distro ships),
+  fall back to `deb.sury.org` for older Debian or `ppa:ondrej/php`
+  for Ubuntu when the default repo can't satisfy the install. Same
+  Debian-vs-Ubuntu split applied to the panel-driven PHP installer
+  in `panel/agent/src/routes/php.rs` so Settings → Services →
+  Install PHP works on Debian too.
+- **`update.sh` self-refresh never fired on the default code path.**
+  Mode auto-detection (`INSTALL_FROM_RELEASE=1` when no Rust toolchain
+  / no source) ran *after* the self-refresh check, so a user running
+  plain `bash /opt/dockpanel/scripts/update.sh` entered with
+  `INSTALL_FROM_RELEASE=0`, failed the self-refresh gate, and then
+  got bumped to `1` by auto-detect — but with the stale local script
+  still executing. Effect: pre-v2.8.16 panels swapped binaries to the
+  latest release just fine, but never picked up script-side fixes
+  (unit-file deploys, nginx config tweaks, install-agent.sh drop into
+  FE_DIST). That's why issue [#56](https://github.com/ovexro/dockpanel/issues/56)
+  resurfaced after the v2.8.14 fix shipped — operators on v2.8.13
+  ran update.sh and stayed on v2.8.13's update.sh logic. Fix: move
+  mode detection ahead of the self-refresh block so
+  `INSTALL_FROM_RELEASE` is correct by the time the gate evaluates.
+  Operators on v2.8.13/v2.8.14/v2.8.15 should run
+  `INSTALL_FROM_RELEASE=1 bash /opt/dockpanel/scripts/update.sh` once
+  to trigger self-refresh; from v2.8.16 onward, plain `bash update.sh`
+  works.
+- **PHP 8.4 not detected as installed.**
+  `panel/agent/src/routes/service_installer.rs` enumerated
+  `php8.{1,2,3}-fpm` to determine if PHP was installed/running, so a
+  Debian 13 install (which lands PHP 8.4 from the default repo) was
+  reported as "PHP not installed" in Settings → Services even when
+  it was running fine. Added `php8.4-fpm` to both checks.
+
+## [2.8.15] - 2026-05-06
+
+### Fixed
+
+- **`update.sh` skipped the repo sync in `INSTALL_FROM_RELEASE=1` mode,
+  so v2.8.14's canonical-unit changes never deployed on the standard
+  upgrade path.** Found by the v2.8.13 → v2.8.14 VPS upgrade test:
+  binaries upgraded to v2.8.14 successfully, but the systemd unit file
+  on disk was still v2.8.13's content (no `RuntimeDirectory=dockpanel`,
+  no `/var/cache/nginx` in `ReadWritePaths=`). Root cause: line 106
+  gated `git pull` behind `INSTALL_FROM_RELEASE != 1`, but the code at
+  line 215 deploys the canonical unit from `$AGENT_SRC` regardless of
+  mode. Same family as the v2.8.13 "dev fiction" bug — canonical file
+  in repo, installer reads stale on-disk copy.
+  - `git pull --ff-only` also didn't cover installs cloned with
+    `-b v2.8.13` (or any explicit tag — they end up on a detached HEAD
+    with no local `main`). Replaced the conditional with an
+    unconditional `git fetch --depth=1 origin main` + `git reset --hard
+    FETCH_HEAD` so the canonical unit, nginx templates, and
+    install-agent.sh are always at the latest origin/main when
+    update.sh runs. Operators who already upgraded to v2.8.14 via
+    `bash update.sh` should re-run it on v2.8.15 to pick up the unit
+    changes; the self-refresh logic added in v2.7.13 will fetch the
+    fixed update.sh from this release.
+
+## [2.8.14] - 2026-05-06
+
+### Fixed
+
+- **WordPress provisioning failures on every fresh install** ([#54](https://github.com/ovexro/dockpanel/issues/54)).
+  Three independent regressions surfaced when the v2.8.12 strict
+  sandbox shipped, each only firing on specific paths so they slipped
+  through the v2.8.13 verification:
+  - `Failed to download wp-cli` — `services/wordpress.rs::ensure_cli`
+    ran `safe_command("curl") -o /usr/local/bin/wp`, but
+    `/usr/local/bin` is not in the agent's `ReadWritePaths` under
+    `ProtectSystem=strict` so the write was blocked silently and
+    bubbled up as a 422 on the WP install endpoint. Switched to
+    `safe_command_unsandboxed("curl", &[])` (the same `systemd-run`
+    escape used for apt/dpkg in v2.8.12) and now surface the curl
+    stderr in the error message instead of just the static "Failed
+    to download wp-cli" string.
+  - `mkdir() "/var/cache/nginx/fastcgi/<site>" failed (ENOENT)` —
+    `routes/nginx.rs::put_site` called `create_dir_all` on the
+    per-site FastCGI cache path before rendering the vhost, but
+    `/var/cache/nginx` was not in the agent's `ReadWritePaths` so
+    the create silently failed (only a `tracing::warn!`). The
+    config was written anyway; nginx -t then fired its own mkdir of
+    the cache leaf, found no parent, and rejected the reload. Added
+    `/var/cache/nginx` to `ReadWritePaths=` in the canonical unit,
+    pre-created `/var/cache/nginx/fastcgi` in `setup.sh` and
+    `update.sh`, and promoted the agent-side `create_dir_all`
+    failure from a `warn!` to a 500 with an actionable message
+    ("Ensure /var/cache/nginx is in the agent's ReadWritePaths") so
+    we never again render a config we know nginx can't validate.
+  - `tar: unrecognized option '--no-dereference'` — three call sites
+    (`services/backups.rs`, `services/wordpress.rs::create_update_snapshot`,
+    `routes/mail.rs::mailbox_backup`) passed `--no-dereference` to
+    `tar -c`. GNU tar 1.35 (current Trixie/Noble default and the
+    version on this server) does not accept that option in create
+    mode, so every site backup, every WP update snapshot, and every
+    mail backup since the flag was introduced has been failing
+    silently — including on the panel's own demo. GNU tar's
+    create-mode default is already "do not follow symlinks", so the
+    fix is to drop the flag from all three sites.
+
+- **`curl … {panel_url}/install-agent.sh | bash` returned the SPA
+  HTML** ([#56](https://github.com/ovexro/dockpanel/issues/56)). The
+  multi-server install command surfaced in `routes/servers.rs`
+  pointed users at `{panel_url}/install-agent.sh`, but the panel's
+  nginx config has `try_files $uri $uri/ /index.html;` with no
+  override for that path — so the URI fell through to the SPA's
+  `index.html` and `bash` choked on `<!DOCTYPE html>`. The script
+  also wasn't deployed under any served path. Fixed by having
+  `setup.sh` and `update.sh` copy `scripts/install-agent.sh` into
+  `$FE_ROOT/install-agent.sh` so the existing `try_files $uri` rule
+  serves it directly with the right MIME.
+
+- **HTTP-on-IP installs were stuck in a login bounce**
+  ([#47](https://github.com/ovexro/dockpanel/issues/47)). The cookie
+  helper in `routes/auth.rs::issue_session` set `Secure` whenever
+  `BASE_URL` was empty (the assumption being that production
+  deployments use HTTPS and an empty default should not regress
+  them). For users running on the bare `http://<ip>:<port>` URL
+  before adding a domain, the browser silently dropped the `Secure`
+  cookie on the plain-HTTP response and `/api/auth/me` then 401'd
+  on the very next request — login appeared to succeed and
+  immediately bounced back to the login screen. Replaced the
+  BASE_URL-only check with a combined `BASE_URL=https://… ||
+  X-Forwarded-Proto: https` check (nginx already sets
+  `X-Forwarded-Proto $scheme`), and threaded the request `HeaderMap`
+  through `issue_session_pub` / `logout` / OAuth `callback` /
+  passkey `auth_complete` so every login path uses the same scheme
+  detection.
+
+- **`/run/dockpanel` disappeared mid-upgrade and pinned the agent at
+  StartLimitBurst** (v2.8.13 followup, surfaced during the demo
+  upgrade-path test). `update.sh` mkdir's `/var/run/dockpanel`
+  before the `systemctl stop / start` cycle, but between stop and
+  start the directory disappeared on Ubuntu — the agent's namespace
+  mount (which now resolves `/run/dockpanel` as a `ReadWritePaths=`
+  symlink target) failed five times in 60s and the unit refused to
+  start until manual `systemd-tmpfiles --create` plus
+  `systemctl reset-failed`. Added `RuntimeDirectory=dockpanel` and
+  `RuntimeDirectoryPreserve=yes` to the canonical unit so systemd
+  creates and persists the directory itself, which fires before the
+  namespace setup and survives every restart.
+
+- **Agent socket occasionally left at 0600 root:root, breaking the
+  panel's "Failed to load system update status" toast.** The
+  systemd unit's `ExecStartPost` was the only thing that chown'd
+  the socket to `www-data` and chmod'd it to 0660 — and it failed
+  silently in some restart sequences, leaving the panel unable to
+  reach the agent over its UNIX socket. The agent now sets the
+  permissions inline right after `UnixListener::bind` (via libc
+  `getgrnam` / `chown` / `set_permissions`), so the unit's
+  `ExecStartPost` is belt-and-suspenders rather than load-bearing.
+
+- **Mail provisioning's `groupadd`/`useradd` for the vmail user
+  failed under strict sandbox.** Same family as #54-A: the
+  `safe_command` wrapper runs sandboxed, but the user-management
+  binaries write `/etc/passwd` / `/etc/shadow` / `/etc/group`,
+  which are too sensitive to put in `ReadWritePaths=`. Switched
+  both calls to `safe_command_unsandboxed("groupadd", &[])` /
+  `safe_command_unsandboxed("useradd", &[])`.
+
 ## [2.8.13] - 2026-05-02
 
 ### Changed

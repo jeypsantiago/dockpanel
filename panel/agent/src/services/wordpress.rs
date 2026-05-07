@@ -1,5 +1,5 @@
 use std::process::Stdio;
-use crate::safe_cmd::{safe_command, safe_command_sync};
+use crate::safe_cmd::{safe_command, safe_command_sync, safe_command_unsandboxed};
 
 const WP_CLI: &str = "/usr/local/bin/wp";
 const WP_ROOT: &str = "/var/www";
@@ -17,7 +17,9 @@ pub async fn ensure_cli() -> Result<(), String> {
     if std::path::Path::new(WP_CLI).exists() {
         return Ok(());
     }
-    let out = safe_command("curl")
+    // curl writes to /usr/local/bin which isn't in the agent's ReadWritePaths
+    // under ProtectSystem=strict — must run unsandboxed.
+    let out = safe_command_unsandboxed("curl", &[])
         .args([
             "-sS",
             "-L",
@@ -29,9 +31,10 @@ pub async fn ensure_cli() -> Result<(), String> {
         .await
         .map_err(|e| format!("Download failed: {e}"))?;
     if !out.status.success() {
-        return Err("Failed to download wp-cli".into());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("Failed to download wp-cli: {}", stderr.trim()));
     }
-    safe_command("chmod")
+    safe_command_unsandboxed("chmod", &[])
         .args(["+x", WP_CLI])
         .output()
         .await
@@ -387,7 +390,7 @@ pub async fn create_update_snapshot(domain: &str) -> Result<String, String> {
     let tar = tokio::time::timeout(
         std::time::Duration::from_secs(120),
         safe_command("tar")
-            .args(["--no-dereference", "czf", &snapshot_path, "-C", "/var/www", &format!("{domain}/public")])
+            .args(["czf", &snapshot_path, "-C", "/var/www", &format!("{domain}/public")])
             .output()
     ).await
         .map_err(|_| "Snapshot tar timed out".to_string())?

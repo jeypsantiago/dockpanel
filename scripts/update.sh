@@ -38,6 +38,38 @@ CLI_BIN="/usr/local/bin/dockpanel"
 INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-0}"
 GITHUB_REPO="${DOCKPANEL_GITHUB_REPO:-jeypsantiago/dockpanel}"
 
+# ── Mode detection (must run BEFORE self-refresh) ─────────────────────────
+# Self-refresh is gated on INSTALL_FROM_RELEASE=1, so the auto-detect that
+# flips it to 1 has to happen first. v2.8.15 and earlier had this in the
+# wrong order: a user running `bash update.sh` (no env vars) entered with
+# INSTALL_FROM_RELEASE=0, failed the self-refresh check, then got bumped
+# to 1 by auto-detect — but with the stale local script still running.
+# Result: binaries upgrade fine, but script-side fixes (unit files, nginx
+# tweaks, install-agent.sh deploy) never reach pre-v2.8.16 panels.
+if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
+    log "No source found — switching to pre-built binary download"
+    INSTALL_FROM_RELEASE=1
+fi
+
+# Auto-detect: if Rust toolchain isn't available, use release binaries.
+# Production VPS installs typically don't have cargo on PATH (and usually
+# don't have enough RAM to compile rustc's dep tree — proc-macro2 OOMs at
+# ~1-2 GB). Fall back to the pre-built artifacts on the matching tag rather
+# than asking the operator to install rustup just to update.
+if [ "$INSTALL_FROM_RELEASE" != "1" ] \
+   && ! command -v cargo > /dev/null 2>&1 \
+   && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+    log "Rust toolchain not found — switching to pre-built binary download"
+    log "(set BUILD_FROM_SOURCE=1 to force compile-from-source instead)"
+    INSTALL_FROM_RELEASE=1
+fi
+
+# Explicit opt-in to keep compile-from-source behaviour even when cargo
+# is on PATH (e.g. for developers iterating on a checkout).
+if [ "${BUILD_FROM_SOURCE:-0}" = "1" ]; then
+    INSTALL_FROM_RELEASE=0
+fi
+
 # ── Self-refresh ──────────────────────────────────────────────────────────
 # In binary-release mode, the on-disk copy of this script can lag the
 # repo by several releases (it's only refreshed by re-running install.sh).
@@ -67,31 +99,6 @@ if [ "${SELF_REFRESHED:-0}" != "1" ] && [ "$INSTALL_FROM_RELEASE" = "1" ]; then
     fi
 fi
 
-# Auto-detect: if no source available, use release binaries
-if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
-    log "No source found — switching to pre-built binary download"
-    INSTALL_FROM_RELEASE=1
-fi
-
-# Auto-detect: if Rust toolchain isn't available, use release binaries.
-# Production VPS installs typically don't have cargo on PATH (and usually
-# don't have enough RAM to compile rustc's dep tree — proc-macro2 OOMs at
-# ~1-2 GB). Fall back to the pre-built artifacts on the matching tag rather
-# than asking the operator to install rustup just to update.
-if [ "$INSTALL_FROM_RELEASE" != "1" ] \
-   && ! command -v cargo > /dev/null 2>&1 \
-   && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
-    log "Rust toolchain not found — switching to pre-built binary download"
-    log "(set BUILD_FROM_SOURCE=1 to force compile-from-source instead)"
-    INSTALL_FROM_RELEASE=1
-fi
-
-# Explicit opt-in to keep compile-from-source behaviour even when cargo
-# is on PATH (e.g. for developers iterating on a checkout).
-if [ "${BUILD_FROM_SOURCE:-0}" = "1" ]; then
-    INSTALL_FROM_RELEASE=0
-fi
-
 # For source builds, verify source exists
 if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
     error "Cannot find agent source at $AGENT_SRC"
@@ -102,13 +109,31 @@ echo ""
 echo -e "${GREEN}${BOLD}DockPanel Updater${NC}"
 echo ""
 
-# ── Pull latest code (only for source builds) ────────────────────────────
-if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ -d "$REPO_DIR/.git" ]; then
-    log "Pulling latest changes..."
-    (cd "$REPO_DIR" && git stash -q 2>/dev/null; git pull --ff-only; git stash pop -q 2>/dev/null || true) || {
-        error "Git pull failed. Resolve conflicts manually."
-        exit 1
-    }
+# ── Sync repo to origin/main ──────────────────────────────────────────────
+# Both modes need a fresh tree: the canonical systemd unit
+# (panel/agent/dockpanel-agent.service), nginx templates, install-agent.sh,
+# and a few other repo-resident files are deployed from $REPO_DIR. Without a
+# pull, `bash /opt/dockpanel/scripts/update.sh` would download new binaries
+# but redeploy the OLD canonical unit — exactly what stranded the v2.8.13 →
+# v2.8.14 upgrade-path test (RuntimeDirectory=dockpanel and /var/cache/nginx
+# in ReadWritePaths never reached the deployed unit). v2.8.15.
+#
+# `git pull --ff-only` doesn't cover installs cloned with `-b vX.Y.Z` (those
+# end up on a detached HEAD with no `main` known locally), so the sync uses
+# `git fetch origin main` + `git reset --hard FETCH_HEAD` to forcibly track
+# main. Local edits to /opt/dockpanel are unsupported (it's a deploy
+# artifact, not a working tree) — `git stash` captures any incidental drift
+# in case anyone wants to inspect it post-upgrade.
+if [ -d "$REPO_DIR/.git" ]; then
+    log "Syncing repo to latest origin/main..."
+    (cd "$REPO_DIR" && {
+        git stash -q 2>/dev/null || true
+        if git fetch --depth=1 origin main 2>/dev/null; then
+            git reset --hard FETCH_HEAD 2>&1 | tail -1 >/dev/null || true
+        else
+            log "Warning: git fetch failed — deploying from existing on-disk source"
+        fi
+    }) || log "Warning: repo sync failed — deploying from existing on-disk source"
 fi
 
 # ── Backup database before upgrade ────────────────────────────────────────
@@ -203,10 +228,22 @@ mkdir -p /var/lib/dockpanel/docker
 # v2.8.13 expanded the RWP list — systemd fails the namespace mount on
 # missing entries, so pre-create everything the canonical unit references.
 for d in /etc/postfix /etc/dovecot /var/vmail /var/spool/postfix /run/opendkim /var/lib/nginx \
-         /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns /etc/letsencrypt; do
+         /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns /etc/letsencrypt \
+         /var/cache/nginx/fastcgi; do
     [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || true
 done
 echo "d /run/dockpanel 0755 root root -" > /etc/tmpfiles.d/dockpanel.conf 2>/dev/null || true
+
+# v2.8.17: drop apt lock-wait config so agent's apt-get install/update/purge
+# waits up to 5 min for the dpkg lock instead of failing immediately when
+# unattended-upgrades is running in the background (common on fresh Debian).
+# Idempotent — overwrites on every update.sh run, no apt operation needed.
+if command -v apt-get &> /dev/null; then
+    mkdir -p /etc/apt/apt.conf.d
+    cat > /etc/apt/apt.conf.d/99-dockpanel-lock-wait.conf << 'APT_EOF'
+DPkg::Lock::Timeout "300";
+APT_EOF
+fi
 
 # ── Refresh systemd service files (may have changed between versions) ─────
 log "Updating systemd service files..."
@@ -254,6 +291,18 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
             nginx -t > /dev/null 2>&1 && nginx -s reload > /dev/null 2>&1
         fi
     done
+else
+    FE_DIST="${REPO_DIR}/panel/frontend/dist"
+fi
+
+# ── Drop install-agent.sh into FE_ROOT (#56, v2.8.14) ─────────────────────
+# Panel SPA-fallback nginx serves $uri before falling back to index.html.
+# Without the script present in FE_ROOT, `curl {panel}/install-agent.sh | bash`
+# returns the SPA HTML and fails with 'syntax error near unexpected token'.
+if [ -f "${REPO_DIR}/scripts/install-agent.sh" ] && [ -d "$FE_DIST" ]; then
+    cp "${REPO_DIR}/scripts/install-agent.sh" "$FE_DIST/install-agent.sh"
+    chmod 644 "$FE_DIST/install-agent.sh"
+    log "Refreshed install-agent.sh in $FE_DIST"
 fi
 
 normalize_domain_value() {
