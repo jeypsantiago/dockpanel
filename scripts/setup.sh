@@ -863,20 +863,9 @@ configure_nginx() {
     local LISTEN_DIRECTIVE="listen ${PANEL_PORT};"
     if [ -n "$PANEL_DOMAIN" ]; then
         SERVER_NAME="$PANEL_DOMAIN"
-        # Use interface IP to match agent-generated site configs (prevents nginx routing conflicts).
-        # Always pair the IPv4 listen with a plain `[::]:80` IPv6 listen so the panel is
-        # reachable via IPv6 too. Without it, agent-managed site vhosts (which bind
-        # `[::]:443 ssl`) become the de-facto default for IPv6 traffic and serve their own
-        # WP/canonical-redirect responses for the panel domain.
-        local BIND_IP
-        BIND_IP=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
-        if [ -n "$BIND_IP" ]; then
-            LISTEN_DIRECTIVE="listen ${BIND_IP}:80;
+        # Use shared listeners so nginx routes panel and site vhosts by server_name.
+        LISTEN_DIRECTIVE="listen 80;
     listen [::]:80;"
-        else
-            LISTEN_DIRECTIVE="listen 80;
-    listen [::]:80;"
-        fi
     fi
 
     cat > "$NGINX_CONF" << NGINXEOF

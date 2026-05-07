@@ -412,10 +412,23 @@ ensure_panel_https_fallback() {
 
 # ── Migrate panel nginx config/listeners and repair panel-domain site collisions ──
 NGINX_NEEDS_RELOAD=0
+NGINX_NEEDS_RESTART=0
 PANEL_DOMAIN_FOR_NGINX=$(detect_panel_domain 2>/dev/null || true)
 if [ -n "$PANEL_DOMAIN_FOR_NGINX" ]; then
     for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
         [ -f "$conf" ] || continue
+        if grep -qE '^[[:space:]]*listen[[:space:]]+[0-9.]+:443[[:space:]]+ssl;' "$conf"; then
+            sed -i -E 's|^([[:space:]]*)listen[[:space:]]+[0-9.]+:443[[:space:]]+ssl;|\1listen 443 ssl;|' "$conf"
+            log "Normalized explicit IPv4 HTTPS listener in $conf for server_name routing"
+            NGINX_NEEDS_RELOAD=1
+            NGINX_NEEDS_RESTART=1
+        fi
+        if grep -qE '^[[:space:]]*listen[[:space:]]+[0-9.]+:80;[[:space:]]*$' "$conf"; then
+            sed -i -E 's|^([[:space:]]*)listen[[:space:]]+[0-9.]+:80;[[:space:]]*$|\1listen 80;|' "$conf"
+            log "Normalized explicit IPv4 HTTP listener in $conf for server_name routing"
+            NGINX_NEEDS_RELOAD=1
+            NGINX_NEEDS_RESTART=1
+        fi
         if grep -q 'ipv6only=on' "$conf"; then
             sed -i -E 's/[[:space:]]+ipv6only=on//g' "$conf"
             log "Stripped ipv6only=on from $conf for shared-socket compatibility"
@@ -464,11 +477,13 @@ if [ -d /etc/nginx/sites-enabled ]; then
             sed -i -E 's|^([[:space:]]*)listen[[:space:]]+[0-9.]+:443[[:space:]]+ssl;|\1listen 443 ssl;|' "$site_conf"
             log "Normalized explicit IPv4 HTTPS listener in $site_conf for server_name routing"
             NGINX_NEEDS_RELOAD=1
+            NGINX_NEEDS_RESTART=1
         fi
         if grep -qE '^[[:space:]]*listen[[:space:]]+[0-9.]+:80;[[:space:]]*$' "$site_conf"; then
             sed -i -E 's|^([[:space:]]*)listen[[:space:]]+[0-9.]+:80;[[:space:]]*$|\1listen 80;|' "$site_conf"
             log "Normalized explicit IPv4 HTTP listener in $site_conf for server_name routing"
             NGINX_NEEDS_RELOAD=1
+            NGINX_NEEDS_RESTART=1
         fi
     done
 fi
@@ -476,7 +491,11 @@ ensure_panel_https_fallback
 repair_panel_domain_site_vhosts
 if [ "$NGINX_NEEDS_RELOAD" = "1" ]; then
     if nginx -t > /dev/null 2>&1; then
-        nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen migration"
+        if [ "$NGINX_NEEDS_RESTART" = "1" ]; then
+            systemctl restart nginx > /dev/null 2>&1 && log "Nginx restarted after listener normalization"
+        else
+            nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen migration"
+        fi
     else
         log "WARN: nginx -t failed after IPv6 listen migration; not reloading. Check sites-enabled/."
     fi
