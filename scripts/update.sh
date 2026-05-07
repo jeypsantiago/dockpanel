@@ -364,6 +364,52 @@ repair_panel_domain_site_vhosts() {
     done
 }
 
+ensure_panel_https_fallback() {
+    local panel_domain conf cert_dir cert_key cert_chain
+    panel_domain=$(detect_panel_domain 2>/dev/null || true)
+    [ -n "$panel_domain" ] || return 0
+
+    cert_dir="/etc/dockpanel/ssl/${panel_domain}"
+    cert_chain="${cert_dir}/fullchain.pem"
+    cert_key="${cert_dir}/privkey.pem"
+
+    if [ ! -f "$cert_chain" ] || [ ! -f "$cert_key" ]; then
+        if ! command -v openssl >/dev/null 2>&1; then
+            warn "OpenSSL not found; cannot create temporary panel HTTPS certificate"
+            return 0
+        fi
+        mkdir -p "$cert_dir"
+        if openssl req -x509 -nodes -newkey rsa:2048 -days 30 \
+            -subj "/CN=${panel_domain}" \
+            -keyout "$cert_key" \
+            -out "$cert_chain" >/dev/null 2>&1; then
+            chmod 600 "$cert_key"
+            log "Created temporary origin TLS certificate for ${panel_domain}"
+        else
+            warn "Could not create temporary origin TLS certificate for ${panel_domain}"
+            return 0
+        fi
+    fi
+
+    for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
+        [ -f "$conf" ] || continue
+        if ! awk -v d="$panel_domain" '/^[[:space:]]*server_name[[:space:]]+/ { for (i=2; i<=NF; i++) { gsub(/;/, "", $i); if (tolower($i) == d) found=1 } } END { exit(found ? 0 : 1) }' "$conf"; then
+            continue
+        fi
+        if ! grep -qE "^[[:space:]]*listen[[:space:]].*443[[:space:]]+ssl" "$conf"; then
+            sed -i -E '0,/^([[:space:]]*)listen[[:space:]][^;]*80;[[:space:]]*$/{s||&\n\1listen 443 ssl;\n\1listen [::]:443 ssl;|}' "$conf"
+            NGINX_NEEDS_RELOAD=1
+        fi
+        if ! grep -qE "^[[:space:]]*ssl_certificate[[:space:]]+" "$conf"; then
+            sed -i -E "/^[[:space:]]*server_name[[:space:]]+/a\\
+\\
+    ssl_certificate ${cert_chain};\\
+    ssl_certificate_key ${cert_key};" "$conf"
+            NGINX_NEEDS_RELOAD=1
+        fi
+    done
+}
+
 # ── Migrate panel nginx config/listeners and repair panel-domain site collisions ──
 NGINX_NEEDS_RELOAD=0
 PANEL_DOMAIN_FOR_NGINX=$(detect_panel_domain 2>/dev/null || true)
@@ -414,8 +460,14 @@ if [ -d /etc/nginx/sites-enabled ]; then
             log "Stripped ipv6only=on from $site_conf for shared-socket compatibility"
             NGINX_NEEDS_RELOAD=1
         fi
+        if grep -qE '^[[:space:]]*listen[[:space:]]+[0-9.]+:443[[:space:]]+ssl;' "$site_conf"; then
+            sed -i -E 's|^([[:space:]]*)listen[[:space:]]+[0-9.]+:443[[:space:]]+ssl;|\1listen 443 ssl;|' "$site_conf"
+            log "Normalized explicit IPv4 HTTPS listener in $site_conf for server_name routing"
+            NGINX_NEEDS_RELOAD=1
+        fi
     done
 fi
+ensure_panel_https_fallback
 repair_panel_domain_site_vhosts
 if [ "$NGINX_NEEDS_RELOAD" = "1" ]; then
     if nginx -t > /dev/null 2>&1; then

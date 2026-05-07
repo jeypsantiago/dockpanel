@@ -142,6 +142,7 @@ pub struct InspectPortRequest {
     pub branch: Option<String>,
     pub dockerfile: Option<String>,
     pub build_context: Option<String>,
+    pub key_path: Option<String>,
 }
 
 fn is_valid_repo_url(url: &str) -> bool {
@@ -163,6 +164,7 @@ async fn inspect_container_port(
     branch: &str,
     dockerfile: &str,
     build_context: &str,
+    key_path: Option<&str>,
 ) -> Option<i32> {
     if repo_url.trim().is_empty() || !is_valid_repo_url(repo_url) {
         return None;
@@ -177,7 +179,7 @@ async fn inspect_container_port(
                 "name": probe_name,
                 "repo_url": repo_url,
                 "branch": branch,
-                "key_path": null,
+                "key_path": key_path,
             })),
         )
         .await
@@ -246,6 +248,16 @@ fn build_args_with_public_env(
     }
 
     serde_json::Value::Object(merged)
+}
+
+fn runtime_port_from_env(env_vars: &serde_json::Value) -> Option<i32> {
+    let port = env_vars
+        .as_object()
+        .and_then(|env| env.get("PORT"))
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.trim().parse::<i32>().ok())?;
+
+    (1..=65535).contains(&port).then_some(port)
 }
 
 /// GET /api/git-deploys — List all git deploys for the current user.
@@ -319,10 +331,17 @@ pub async fn create(
         hex::encode(bytes)
     };
 
+    let env_vars = body
+        .env_vars
+        .as_ref()
+        .map(|e| serde_json::to_value(e).unwrap_or_default())
+        .unwrap_or(serde_json::json!({}));
     let branch = body.branch.as_deref().unwrap_or("main");
     let dockerfile = body.dockerfile.as_deref().unwrap_or("Dockerfile");
     let build_context = body.build_context.as_deref().unwrap_or(".");
     let container_port = if let Some(port) = body.container_port {
+        port
+    } else if let Some(port) = runtime_port_from_env(&env_vars) {
         port
     } else {
         inspect_container_port(
@@ -331,16 +350,17 @@ pub async fn create(
             branch,
             dockerfile,
             build_context,
+            None,
         )
         .await
-        .unwrap_or(3000)
+        .ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "Unable to auto-detect the container port. Please enter it manually.",
+            )
+        })?
     };
     let auto_deploy = body.auto_deploy.unwrap_or(false);
-    let env_vars = body
-        .env_vars
-        .as_ref()
-        .map(|e| serde_json::to_value(e).unwrap_or_default())
-        .unwrap_or(serde_json::json!({}));
     let build_args = body
         .build_args
         .as_ref()
@@ -603,10 +623,21 @@ pub async fn update(
     let branch = body.branch.as_deref().unwrap_or(&current.branch);
     let dockerfile = body.dockerfile.as_deref().unwrap_or(&current.dockerfile);
     let build_context = body.build_context.as_deref().unwrap_or(&current.build_context);
+    let port_env_source = env_vars.as_ref().unwrap_or(&current.env_vars);
     let resolved_container_port = if let Some(port) = body.container_port {
         Some(port)
+    } else if let Some(port) = runtime_port_from_env(port_env_source) {
+        Some(port)
     } else {
-        inspect_container_port(&agent, repo_url, branch, dockerfile, build_context).await
+        inspect_container_port(
+            &agent,
+            repo_url,
+            branch,
+            dockerfile,
+            build_context,
+            current.deploy_key_path.as_deref(),
+        )
+        .await
     };
 
     let deploy: GitDeploy = sqlx::query_as(
@@ -688,9 +719,21 @@ pub async fn inspect_port(
     let branch = body.branch.as_deref().unwrap_or("main");
     let dockerfile = body.dockerfile.as_deref().unwrap_or("Dockerfile");
     let build_context = body.build_context.as_deref().unwrap_or(".");
-    let container_port = inspect_container_port(&agent, body.repo_url.trim(), branch, dockerfile, build_context)
+    let container_port = inspect_container_port(
+        &agent,
+        body.repo_url.trim(),
+        branch,
+        dockerfile,
+        build_context,
+        body.key_path.as_deref(),
+    )
         .await
-        .unwrap_or(3000);
+        .ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "Unable to auto-detect the container port. Please enter it manually.",
+            )
+        })?;
 
     Ok(Json(serde_json::json!({
         "container_port": container_port,
