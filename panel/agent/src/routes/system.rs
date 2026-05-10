@@ -1,4 +1,4 @@
-use crate::safe_cmd::safe_command;
+use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
 use axum::{extract::State, routing::get, Json, Router};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -253,8 +253,9 @@ async fn read_diskstats() -> (u64, u64) {
 async fn disk_cleanup() -> Json<serde_json::Value> {
     let mut freed = Vec::new();
 
-    // 1. apt cache
-    if safe_command("apt-get").args(["clean"]).output().await.is_ok() {
+    // 1. apt cache — unsandboxed because /var/cache/apt is outside the
+    // agent unit's ReadWritePaths and apt-get clean would silently no-op.
+    if safe_command_unsandboxed("apt-get", &[]).args(["clean"]).output().await.is_ok() {
         freed.push("apt cache");
     }
 

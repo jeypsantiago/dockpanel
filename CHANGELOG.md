@@ -6,6 +6,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.19] - 2026-05-10
+
+### Fixed
+
+- **Mail server install failed under the agent's strict sandbox** ([#57]
+  follow-up by @WiskeyPapa). `routes/mail.rs::install_mail` was running
+  `apt-get install` via the sandboxed `safe_command(...)` wrapper, so the
+  agent unit's `ProtectSystem=strict` made `/var/lib/dpkg/lock-frontend`
+  read-only inside the namespace. apt printed `Not using locking for read
+  only lock file /var/lib/dpkg/lock-frontend` warnings and then bailed when
+  it tried to `chown` files. Switched the four apt-get call sites in
+  `mail.rs` (install / purge / autoremove / rspamd install) to
+  `safe_command_unsandboxed`, matching the #54-A pattern v2.8.14 applied to
+  vmail `useradd`/`groupadd` (which lived right next to the apt-get call
+  that this commit corrects). `routes/system.rs::disk_cleanup`'s
+  `apt-get clean` got the same treatment so `/var/cache/apt` actually gets
+  cleared.
+- **Cloudflare Tunnel install wrote a literal `$(lsb_release -cs)` into
+  `/etc/apt/sources.list.d/cloudflared.list`** ([#57] follow-up by
+  @WiskeyPapa). The shell pipeline used **single quotes** around the echo
+  argument, which prevents bash command substitution. Once the broken
+  source landed, every subsequent `apt-get update` on the box failed
+  (`The repository '... $(lsb_release Release' does not have a Release
+  file`), blocking unrelated installs (Redis, WAF, Mail Server). Pre-resolve
+  `VERSION_CODENAME` from `/etc/os-release` in Rust and `printf` the source
+  line with the actual codename — also drops the `lsb-release` package
+  dependency on minimal Debian images. Defensive: on install failure,
+  delete a half-written source file so it doesn't break the rest of apt.
+- **`update.sh` now repairs an existing broken cloudflared apt source on
+  upgrade.** Operators who already hit the bug get auto-cleanup on
+  `INSTALL_FROM_RELEASE=1 bash update.sh` — no manual `rm` needed. Looks
+  for the literal `$(lsb_release` string in
+  `/etc/apt/sources.list.d/cloudflared.list` and removes the file if
+  found.
+
 ## [2.8.18] - 2026-05-06
 
 ### Added
