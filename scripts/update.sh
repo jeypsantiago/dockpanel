@@ -243,6 +243,19 @@ if command -v apt-get &> /dev/null; then
     cat > /etc/apt/apt.conf.d/99-dockpanel-lock-wait.conf << 'APT_EOF'
 DPkg::Lock::Timeout "300";
 APT_EOF
+
+    # v2.8.19: pre-v2.8.19 cloudflared installs wrote a literal
+    # `$(lsb_release -cs)` into /etc/apt/sources.list.d/cloudflared.list
+    # (single-quoted bash didn't expand the substitution). Once landed, the
+    # broken file made every subsequent `apt-get update` on the box fail —
+    # blocking unrelated installs (Redis, WAF, …). Repair it here so
+    # operators upgrading via update.sh get an unblocked apt without manual
+    # intervention.
+    if [ -f /etc/apt/sources.list.d/cloudflared.list ] && \
+       grep -qF '$(lsb_release' /etc/apt/sources.list.d/cloudflared.list; then
+        log "Removing broken cloudflared apt source (literal \$(lsb_release ...) — fixed in v2.8.19)"
+        rm -f /etc/apt/sources.list.d/cloudflared.list
+    fi
 fi
 
 # ── Refresh systemd service files (may have changed between versions) ─────

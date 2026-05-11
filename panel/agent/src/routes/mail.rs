@@ -152,13 +152,18 @@ async fn mail_status() -> Result<Json<serde_json::Value>, ApiErr> {
 async fn mail_install() -> Result<Json<serde_json::Value>, ApiErr> {
     tracing::info!("Starting mail server installation...");
 
-    // 1. Install packages
+    // 1. Install packages.
+    // Must be unsandboxed so apt can write /var/lib/dpkg/lock-frontend (the
+    // agent unit's ProtectSystem=strict makes /var/lib/dpkg read-only inside
+    // the namespace, which leaves apt with "Not using locking for read only
+    // lock file" warnings followed by chown failures). Same #54-A pattern
+    // applied to vmail useradd/groupadd below — the apt-get call was missed.
+    // (issue #57 follow-up from WiskeyPapa, v2.8.19)
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("apt-get")
+        safe_command_unsandboxed("apt-get", &[])
             .args(["-o", "Dpkg::Options::=--force-confnew", "install", "-y",
                    "postfix", "dovecot-imapd", "dovecot-pop3d", "dovecot-lmtpd", "opendkim", "opendkim-tools"])
-            .env("DEBIAN_FRONTEND", "noninteractive")
             .output()
     ).await
         .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, "Mail package installation timed out (300s)"))?
@@ -350,14 +355,13 @@ async fn mail_uninstall() -> Result<Json<serde_json::Value>, ApiErr> {
         ).await;
     }
 
-    // 2. Purge packages
+    // 2. Purge packages — unsandboxed for the same reason as install above.
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("apt-get")
+        safe_command_unsandboxed("apt-get", &[])
             .args(["purge", "-y",
                    "postfix", "dovecot-imapd", "dovecot-pop3d", "dovecot-lmtpd",
                    "opendkim", "opendkim-tools"])
-            .env("DEBIAN_FRONTEND", "noninteractive")
             .output()
     ).await
         .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, "Package removal timed out (300s)"))?
@@ -369,12 +373,11 @@ async fn mail_uninstall() -> Result<Json<serde_json::Value>, ApiErr> {
             &format!("Package purge failed: {}", stderr.chars().take(200).collect::<String>())));
     }
 
-    // 3. Autoremove
+    // 3. Autoremove — unsandboxed for the same reason as install above.
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("apt-get")
+        safe_command_unsandboxed("apt-get", &[])
             .args(["autoremove", "-y"])
-            .env("DEBIAN_FRONTEND", "noninteractive")
             .output()
     ).await;
 
@@ -793,12 +796,12 @@ async fn queue_delete(
 async fn rspamd_install() -> Result<Json<serde_json::Value>, ApiErr> {
     tracing::info!("Installing Rspamd spam filter...");
 
-    // Install rspamd
+    // Install rspamd — unsandboxed for the same dpkg-lock reason as the
+    // postfix/dovecot install in install_mail.
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("apt-get")
+        safe_command_unsandboxed("apt-get", &[])
             .args(["-o", "Dpkg::Options::=--force-confnew", "install", "-y", "rspamd", "redis-server"])
-            .env("DEBIAN_FRONTEND", "noninteractive")
             .output()
     ).await
         .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, "Rspamd installation timed out (300s)"))?

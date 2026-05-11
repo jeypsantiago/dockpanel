@@ -972,19 +972,37 @@ async fn uninstall_waf() -> Result<Json<serde_json::Value>, ApiErr> {
 async fn install_cloudflared() -> Result<Json<serde_json::Value>, ApiErr> {
     tracing::info!("Installing cloudflared...");
 
+    // Pre-resolve the codename in Rust. Inline `$(lsb_release -cs)` in
+    // single-quoted bash didn't expand and shipped the literal string into
+    // /etc/apt/sources.list.d/cloudflared.list, breaking apt-get update
+    // system-wide (issue #57 follow-up, v2.8.19).
+    let codename = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|s| {
+            s.lines().find_map(|l| l.strip_prefix("VERSION_CODENAME=").map(|v| v.trim_matches('"').to_string()))
+        })
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR,
+            "Cannot detect OS codename from /etc/os-release (need VERSION_CODENAME)"))?;
+
+    let script = format!(
+        "curl -sL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg && \
+         printf 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared %s main\\n' {codename} > /etc/apt/sources.list.d/cloudflared.list && \
+         DEBIAN_FRONTEND=noninteractive apt-get update && \
+         DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared"
+    );
+
     let output = tokio::time::timeout(
         Duration::from_secs(120),
-        safe_command_unsandboxed("sh", &[])
-            .args(["-c", "curl -sL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg && \
-                echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main' > /etc/apt/sources.list.d/cloudflared.list && \
-                DEBIAN_FRONTEND=noninteractive apt-get update && \
-                DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared"])
-            .output()
+        safe_command_unsandboxed("sh", &[]).args(["-c", &script]).output()
     ).await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "cloudflared install timed out"))?
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Install: {e}")))?;
 
     if !output.status.success() {
+        // A partial install can leave a half-written sources file behind which
+        // would break every subsequent apt-get update on the box. Wipe it.
+        let _ = std::fs::remove_file("/etc/apt/sources.list.d/cloudflared.list");
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR,
             &format!("cloudflared install failed: {}", stderr.chars().take(400).collect::<String>())));
