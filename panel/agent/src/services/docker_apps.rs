@@ -1474,6 +1474,17 @@ static TEMPLATES: &[AppTemplateDef] = &[
         env_vars: &[],
         volumes: &["/var/jenkins_home"],
     },
+    AppTemplateDef {
+        id: "pocketbase",
+        name: "PocketBase",
+        description: "Backend in one file with database, auth, file storage, and admin UI",
+        category: "Development",
+        image: "ghcr.io/muchobien/pocketbase:latest",
+        default_port: 8090,
+        container_port: "8090/tcp",
+        env_vars: &[],
+        volumes: &["/pb_data", "/pb_public", "/pb_hooks"],
+    },
     // Woodpecker CI already exists above — skipped duplicate
     // ─── Databases (additional) ─────────────────────────────────
     AppTemplateDef {

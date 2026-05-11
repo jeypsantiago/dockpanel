@@ -44,7 +44,7 @@ No other free panel gives you Git push-to-deploy with blue-green zero-downtime u
 |---|---|---|---|---|
 | **Price** | **Free** | Free | Free | $8/mo+ |
 | **Stack** | **Rust + React** | PHP | PHP | PHP (SaaS) |
-| **Docker native** | **152 templates** | No | No | No |
+| **Docker native** | **153 templates** | No | No | No |
 | **Git deploy** | **Blue-green, zero-downtime** | No | No | Basic |
 | **Multi-server** | **Unlimited** | No | No | Yes |
 | **Reseller + white-label** | **Yes** | Reseller only | No | No |
@@ -74,7 +74,7 @@ No other free panel gives you Git push-to-deploy with blue-green zero-downtime u
 </details>
 
 <details>
-<summary><strong>Docker Apps</strong> — 152 one-click templates across 14 categories</summary>
+<summary><strong>Docker Apps</strong> — 153 one-click templates across 14 categories</summary>
 
 ![Docker Apps](.github/screenshots/dp-apps.png)
 </details>
@@ -162,7 +162,7 @@ No other free panel gives you Git push-to-deploy with blue-green zero-downtime u
 ### Hosting
 - **Sites** — Static, PHP (8.1-8.4), Node.js, Python, reverse proxy. Automatic Nginx config, SSL, PHP-FPM pools.
 - **Databases** — MySQL/PostgreSQL in Docker. Built-in SQL browser, visual schema browser, point-in-time recovery (WAL/binlog). Auto-cleanup on site delete.
-- **Docker Apps** — 152 templates across 14 categories (AI, CMS, Database, Media, Monitoring, and more). Compose stacks. Resource limits. GPU passthrough.
+- **Docker Apps** — 153 templates across 14 categories (AI, CMS, Database, Media, Monitoring, and more). Compose stacks. Resource limits. GPU passthrough.
 - **Git Deploy** — Push-to-deploy. Atomic zero-downtime deploys (Capistrano-style). Nixpacks (30+ languages). Preview environments.
 - **WordPress Toolkit** — Multi-site dashboard, vulnerability scanning, security hardening, bulk updates.
 - **CMS Install** — WordPress, Laravel, Drupal, Joomla, Symfony, CodeIgniter — one click.

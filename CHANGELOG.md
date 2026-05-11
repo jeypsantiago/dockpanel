@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.20] - 2026-05-11
+
+### Added
+
+- **PocketBase Docker app template.** Adds a one-click PocketBase template using
+  `ghcr.io/muchobien/pocketbase:latest` on port `8090`, with persistent
+  `/pb_data`, `/pb_public`, and `/pb_hooks` mounts. The template does not set
+  superuser environment variables, so PocketBase keeps its first-superuser setup
+  flow until an admin account exists.
+
 ## [2.8.19] - 2026-05-10
 
 ### Fixed
