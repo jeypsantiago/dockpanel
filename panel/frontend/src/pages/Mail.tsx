@@ -561,7 +561,7 @@ export default function Mail() {
               ) : (
                 <div className="flex gap-2">
                   {webmail.running && (
-                    <a href={`http://${window.location.hostname}:${webmail.port}`} target="_blank" rel="noopener noreferrer" className="flex-1 px-3 py-1.5 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 transition-colors text-center">Open</a>
+                    <a href="/webmail/" target="_blank" rel="noopener noreferrer" className="flex-1 px-3 py-1.5 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 transition-colors text-center">Open</a>
                   )}
                   <button onClick={() => setPendingConfirm({ type: "remove_webmail", label: "Remove Roundcube webmail?" })}
                     className="flex-1 px-3 py-1.5 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 transition-colors">Remove</button>

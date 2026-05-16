@@ -373,11 +373,41 @@ if [ -d /etc/nginx/sites-enabled ]; then
         fi
     done
 fi
+# ── v2.8.22: ensure panel vhost includes dockpanel-panel.locations/*.conf ─
+# Drop-in dir for path-mounted tool reverse-proxies. Webmail uses this in
+# v2.8.22+ (writes webmail.conf on install, deletes on remove). Pre-v2.8.22
+# panel vhosts lack the include directive — inject it just before the
+# server-block closing brace via awk (sed nested-brace handling is fragile).
+mkdir -p /etc/nginx/conf.d/dockpanel-panel.locations
+for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
+    [ -f "$conf" ] || continue
+    if ! grep -q "dockpanel-panel.locations" "$conf"; then
+        # Inject before the FIRST top-level `}` (the server block close).
+        # Panel vhost has exactly one top-level `}`, so single-match is safe.
+        if awk '
+            /^}/ && !done {
+                print "    # Drop-in location blocks for path-mounted tools (webmail, etc.)";
+                print "    include /etc/nginx/conf.d/dockpanel-panel.locations/*.conf;";
+                print "";
+                done=1
+            }
+            { print }
+        ' "$conf" > "$conf.new" && [ -s "$conf.new" ]; then
+            mv "$conf.new" "$conf"
+            log "Added dockpanel-panel.locations include to $conf"
+            NGINX_NEEDS_RELOAD=1
+        else
+            rm -f "$conf.new"
+            log "WARN: failed to inject panel-locations include into $conf — skipped"
+        fi
+    fi
+done
+
 if [ "$NGINX_NEEDS_RELOAD" = "1" ]; then
     if nginx -t > /dev/null 2>&1; then
-        nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen migration"
+        nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen + panel-locations migration"
     else
-        log "WARN: nginx -t failed after IPv6 listen migration; not reloading. Check sites-enabled/."
+        log "WARN: nginx -t failed after IPv6 listen + panel-locations migration; not reloading. Check sites-enabled/."
     fi
 fi
 

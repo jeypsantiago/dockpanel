@@ -733,6 +733,11 @@ configure_nginx() {
         fi
     fi
 
+    # Drop-in dir for path-mounted tool reverse-proxies (webmail in v2.8.22+, etc.)
+    # Agent writes fragment files here on tool install/remove; setup.sh + update.sh
+    # only ensure the include directive is present in the panel vhost.
+    mkdir -p /etc/nginx/conf.d/dockpanel-panel.locations
+
     cat > "$NGINX_CONF" << NGINXEOF
 server {
     ${LISTEN_DIRECTIVE}
@@ -797,6 +802,9 @@ server {
         expires 1y;
         add_header Cache-Control "public, immutable";
     }
+
+    # Drop-in location blocks for path-mounted tools (webmail, etc.)
+    include /etc/nginx/conf.d/dockpanel-panel.locations/*.conf;
 
     # Hide nginx version
     server_tokens off;

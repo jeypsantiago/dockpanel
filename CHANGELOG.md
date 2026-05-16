@@ -6,6 +6,60 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.22] - 2026-05-16
+
+### Fixed
+
+- **Webmail "Open" button on the Mail page was unreachable** ([#57] third
+  finding by @WiskeyPapa). The Roundcube container is bound to
+  `127.0.0.1:8888` on the host (loopback only — never exposed to the
+  public IP for security), but the frontend Open button generated a
+  `http://<panel-hostname>:8888` URL. That URL has nothing listening on
+  it (and Cloudflare doesn't proxy port 8888 anyway), so the button
+  produced a hang / connection refused.
+
+  Fixed by reverse-proxying Roundcube under `/webmail/` on the existing
+  panel nginx vhost via a drop-in fragment file. The frontend Open URL
+  is now `${origin}/webmail/` — same-origin, inherits the panel's TLS,
+  works on both HTTPS-with-domain and HTTP-on-IP installs. The
+  Roundcube container also gets new env vars
+  (`ROUNDCUBEMAIL_PROXY_WHITELIST=127.0.0.1`, plus
+  `ROUNDCUBEMAIL_TRUSTED_HOSTS` and `ROUNDCUBEMAIL_FORWARDED_PROTO=https`
+  when the panel has a configured `server_name`) so Roundcube accepts
+  the forwarded headers and generates correct URLs behind the proxy.
+
+### Changed
+
+- `webmail_install` is now idempotent — clicking Install when an existing
+  `dockpanel-roundcube` container is present tears it down before
+  recreating, so env-var additions across releases (like the v2.8.22
+  proxy/trusted-hosts envs) apply automatically on next Install click.
+  Users who deployed Roundcube on v2.8.20/v2.8.21 just need to click
+  Install again, which now rebuilds in place. The `webmail_remove`
+  endpoint also tears down the panel-vhost reverse-proxy fragment for
+  clean uninstall.
+
+- Panel nginx vhost gains an `include
+  /etc/nginx/conf.d/dockpanel-panel.locations/*.conf;` directive (baked
+  into `scripts/setup.sh`'s vhost template; injected into existing
+  vhosts by `scripts/update.sh` via an awk-based one-time migration —
+  same shape as the v2.8.3 IPv6-listen migration). Drop-in directory
+  for path-mounted tool reverse-proxies; webmail is the first user, but
+  other tools (phpMyAdmin, Adminer) can use the same mechanism in the
+  future.
+
+### Internal
+
+- New helper `panel_server_name()` in
+  `panel/agent/src/routes/mail.rs` reads the panel vhost's
+  `server_name` directive to drive Roundcube's `TRUSTED_HOSTS`
+  computation — same approach `update.sh` uses to detect the panel
+  domain for `BASE_URL` auto-population.
+- New helpers `write_webmail_nginx(port)` /
+  `remove_webmail_nginx()` write the `/webmail/` location fragment,
+  validate via `nginx -t`, and reload on success. Failed validation
+  unlinks the fragment so nginx is never left in a broken state.
+
 ## [2.8.21] - 2026-05-16
 
 ### Fixed

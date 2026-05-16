@@ -889,43 +889,136 @@ async fn rspamd_toggle(Json(body): Json<serde_json::Value>) -> Result<Json<serde
 
 // ── Webmail (Roundcube) ─────────────────────────────────────────────────
 
+const WEBMAIL_NGINX_CONF: &str = "/etc/nginx/conf.d/dockpanel-panel.locations/webmail.conf";
+const WEBMAIL_NGINX_DIR: &str = "/etc/nginx/conf.d/dockpanel-panel.locations";
+
+/// Read the panel vhost's `server_name` directive. Returns `None` for
+/// `_` (IP-based installs) or if no panel vhost exists yet.
+fn panel_server_name() -> Option<String> {
+    for conf in &[
+        "/etc/nginx/sites-enabled/dockpanel-panel.conf",
+        "/etc/nginx/conf.d/dockpanel-panel.conf",
+    ] {
+        if let Ok(content) = std::fs::read_to_string(conf) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("server_name ") {
+                    let name = rest.trim_end_matches(';').trim();
+                    if !name.is_empty() && name != "_" {
+                        if let Some(first) = name.split_whitespace().next() {
+                            return Some(first.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Write the `/webmail/` reverse-proxy nginx fragment into the panel-locations
+/// drop-in dir, validate with `nginx -t`, reload on success. Unlinks the
+/// fragment if validation fails — never leaves nginx in a broken state.
+async fn write_webmail_nginx(port: u16) -> Result<(), ApiErr> {
+    if let Err(e) = std::fs::create_dir_all(WEBMAIL_NGINX_DIR) {
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to create {WEBMAIL_NGINX_DIR}: {e}")));
+    }
+    let block = format!(
+        "# DockPanel webmail (Roundcube) reverse-proxy — managed by agent, do not edit\n\
+         location /webmail/ {{\n\
+         \x20   proxy_pass http://127.0.0.1:{port}/;\n\
+         \x20   proxy_http_version 1.1;\n\
+         \x20   proxy_set_header Host $host;\n\
+         \x20   proxy_set_header X-Real-IP $remote_addr;\n\
+         \x20   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n\
+         \x20   proxy_set_header X-Forwarded-Proto $scheme;\n\
+         \x20   proxy_set_header X-Forwarded-Host $host;\n\
+         \x20   proxy_redirect off;\n\
+         \x20   proxy_read_timeout 300s;\n\
+         \x20   client_max_body_size 25M;\n\
+         }}\n"
+    );
+    if let Err(e) = std::fs::write(WEBMAIL_NGINX_CONF, &block) {
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write {WEBMAIL_NGINX_CONF}: {e}")));
+    }
+    let test = safe_command("nginx").args(["-t"]).output().await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("nginx -t failed: {e}")))?;
+    if !test.status.success() {
+        let _ = std::fs::remove_file(WEBMAIL_NGINX_CONF);
+        let stderr = String::from_utf8_lossy(&test.stderr);
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("nginx config invalid: {}", &stderr[..400.min(stderr.len())])));
+    }
+    if let Err(e) = safe_command("nginx").args(["-s", "reload"]).output().await {
+        tracing::warn!("nginx reload failed after webmail install: {e}");
+    }
+    Ok(())
+}
+
+async fn remove_webmail_nginx() {
+    if Path::new(WEBMAIL_NGINX_CONF).exists() {
+        let _ = std::fs::remove_file(WEBMAIL_NGINX_CONF);
+        if let Ok(out) = safe_command("nginx").args(["-t"]).output().await {
+            if out.status.success() {
+                let _ = safe_command("nginx").args(["-s", "reload"]).output().await;
+            }
+        }
+    }
+}
+
 /// POST /mail/webmail/install — Deploy Roundcube webmail via Docker.
+///
+/// Idempotent: tears down any prior `dockpanel-roundcube` container before
+/// recreating, so env-var additions across releases apply on next Install
+/// click. Also writes the panel-vhost reverse-proxy fragment so the Open
+/// button at `${panel}/webmail/` works on both HTTP-on-IP and HTTPS-domain
+/// installs.
 async fn webmail_install(Json(body): Json<serde_json::Value>) -> Result<Json<serde_json::Value>, ApiErr> {
     let domain = body.get("domain").and_then(|v| v.as_str()).unwrap_or("localhost");
     let port = body.get("port").and_then(|v| v.as_u64()).unwrap_or(8888) as u16;
 
     tracing::info!("Installing Roundcube webmail on port {port}...");
 
-    // Run Roundcube as Docker container
+    let _ = safe_command("docker").args(["rm", "-f", "dockpanel-roundcube"]).output().await;
+
+    let panel_host = panel_server_name();
+    let mut args: Vec<String> = vec![
+        "run".into(), "-d".into(),
+        "--name".into(), "dockpanel-roundcube".into(),
+        "--restart".into(), "unless-stopped".into(),
+        "-p".into(), format!("127.0.0.1:{port}:80"),
+        "-e".into(), format!("ROUNDCUBEMAIL_DEFAULT_HOST=ssl://{domain}"),
+        "-e".into(), "ROUNDCUBEMAIL_DEFAULT_PORT=993".into(),
+        "-e".into(), format!("ROUNDCUBEMAIL_SMTP_SERVER=tls://{domain}"),
+        "-e".into(), "ROUNDCUBEMAIL_SMTP_PORT=587".into(),
+        "-e".into(), "ROUNDCUBEMAIL_UPLOAD_MAX_FILESIZE=25M".into(),
+        "-e".into(), "ROUNDCUBEMAIL_PROXY_WHITELIST=127.0.0.1".into(),
+    ];
+    if let Some(host) = panel_host.as_deref() {
+        args.push("-e".into());
+        args.push(format!("ROUNDCUBEMAIL_TRUSTED_HOSTS={host}"));
+        args.push("-e".into());
+        args.push("ROUNDCUBEMAIL_FORWARDED_PROTO=https".into());
+    }
+    args.extend([
+        "-l".into(), "dockpanel.managed=true".into(),
+        "-l".into(), "dockpanel.app.template=roundcube".into(),
+        "-l".into(), "dockpanel.app.name=roundcube".into(),
+        "roundcube/roundcubemail:latest".into(),
+    ]);
+
     let output = safe_command("docker")
-        .args([
-            "run", "-d",
-            "--name", "dockpanel-roundcube",
-            "--restart", "unless-stopped",
-            "-p", &format!("127.0.0.1:{port}:80"),
-            "-e", &format!("ROUNDCUBEMAIL_DEFAULT_HOST=ssl://{domain}"),
-            "-e", "ROUNDCUBEMAIL_DEFAULT_PORT=993",
-            "-e", &format!("ROUNDCUBEMAIL_SMTP_SERVER=tls://{domain}"),
-            "-e", "ROUNDCUBEMAIL_SMTP_PORT=587",
-            "-e", "ROUNDCUBEMAIL_UPLOAD_MAX_FILESIZE=25M",
-            "-l", "dockpanel.managed=true",
-            "-l", "dockpanel.app.template=roundcube",
-            "-l", "dockpanel.app.name=roundcube",
-            "roundcube/roundcubemail:latest",
-        ])
+        .args(args.iter().map(|s| s.as_str()))
         .output().await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Docker failed: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("already in use") {
-            let _ = safe_command("docker").args(["rm", "-f", "dockpanel-roundcube"]).output().await;
-            return Err(err(StatusCode::CONFLICT, "Roundcube container already exists. Remove it first or restart."));
-        }
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Roundcube deploy failed: {}", &stderr[..200.min(stderr.len())])));
     }
 
-    tracing::info!("Roundcube webmail deployed on port {port}");
+    write_webmail_nginx(port).await?;
+
+    tracing::info!("Roundcube webmail deployed on port {port}, panel-vhost /webmail/ proxy active");
     Ok(Json(serde_json::json!({ "ok": true, "port": port })))
 }
 
@@ -945,9 +1038,10 @@ async fn webmail_status() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "installed": running || port > 0, "running": running, "port": port }))
 }
 
-/// POST /mail/webmail/remove — Remove Roundcube container.
+/// POST /mail/webmail/remove — Remove Roundcube container + panel-vhost fragment.
 async fn webmail_remove() -> Result<Json<serde_json::Value>, ApiErr> {
     let _ = safe_command("docker").args(["rm", "-f", "dockpanel-roundcube"]).output().await;
+    remove_webmail_nginx().await;
     Ok(ok("Roundcube removed"))
 }
 
