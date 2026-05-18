@@ -6,15 +6,302 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-## [2.8.20] - 2026-05-11
-
-### Added
-
 - **PocketBase Docker app template.** Adds a one-click PocketBase template using
   `ghcr.io/muchobien/pocketbase:latest` on port `8090`, with persistent
   `/pb_data`, `/pb_public`, and `/pb_hooks` mounts. The template does not set
   superuser environment variables, so PocketBase keeps its first-superuser setup
   flow until an admin account exists.
+
+## [2.10.0] - 2026-05-16
+
+Phase 4 W4 ships **panel self-update from the UI** with health-check
+rollback, **persistent snapshots**, **update channels** (stable /
+candidate / hold), and **fleet rolling updates**.
+
+The reframing matters: `scripts/update.sh:430-499` already ships a
+production-tested binary-swap + .bak-restore rollback flow. v2.10.0 does
+NOT reimplement that — the new orchestrator (`services/panel_update.rs`)
+shells out to the same script under a controlled environment
+(`DOCKPANEL_NO_SELF_REFRESH=1` + `DOCKPANEL_VERSION=<target>`) so every
+bug fix already in update.sh (self-refresh ordering from v2.8.15-16,
+lock-wait conf from v2.8.17, fragment-include awk migration from v2.8.22,
+ACME cooldown from v2.8.23) keeps working unchanged. The new code is a
+presentation + persistence layer over a proven core.
+
+### Added
+- **Apply Update button in Telemetry → Updates tab.** Click → confirm
+  modal showing target version + 4-step preview ("snapshot, download,
+  swap, probe") → status modal that polls `/api/update/status` every 2s.
+  Replaces the static SSH copy-paste block.
+- **Pre-update snapshot service** (`services/panel_snapshot.rs`). Each
+  Apply call first writes a tar.gz triplet to
+  `/var/backups/dockpanel/snapshots/` containing
+  `binaries/{agent,api,cli}` + `db/dump.sql.gz`
+  (`pg_dump --clean --if-exists`) + `etc/dockpanel/` + `metadata.json`.
+  Written to `.tmp` then atomically renamed; DB row only inserted after
+  rename succeeds. Refuses to create when the snapshot partition has
+  less than 2 GiB free.
+- **Operator-triggered rollback from the UI.** Each snapshot row has a
+  Roll back button (confirms then restores binaries + DB + /etc and
+  bounces services). Reach back to any retained snapshot, not just the
+  `.bak` that `update.sh` keeps for ~30 seconds.
+- **Update channels:** stable (GA only — current default behaviour),
+  candidate (includes `prerelease: true` builds, takes the first by
+  `published_at` desc), hold (skips the 6h auto-poll entirely; Manual
+  Check button still works). Channel selector in Updates tab, single
+  `settings.update_channel` row.
+- **Fleet rolling update.** Operator-initiated form in Updates tab:
+  target version + halt-on-failure + include-panel toggles. Plan = all
+  user-owned remote servers reachable in the last 5 minutes, sorted
+  oldest agent_version first. POSTs to each agent's new `/panel/update`
+  endpoint, polls `/panel/update/status` for terminal state, records
+  per-server progress in `fleet_update_runs.progress` JSONB. Halts on
+  first failure unless `halt_on_failure: false`.
+- **Agent-side `/panel/update` receiver**
+  (`panel/agent/src/routes/panel_update.rs`). Distinct from the existing
+  OS-package `/system/updates/*` endpoints. Bearer-auth, returns 202,
+  spawns `update.sh` detached so the agent's own systemctl restart
+  doesn't break the subprocess pipeline.
+- **10 new admin endpoints** under `/api/update/*` + `/api/snapshots/*`:
+  GET `/status`, POST `/apply`, POST `/manual-check`, POST `/rollback`,
+  GET+PUT `/channel`, GET+POST `/api/snapshots`, DELETE
+  `/api/snapshots/{id}`, GET+POST `/update/fleet`, GET
+  `/update/fleet/{id}`. All admin-gated.
+- **Snapshot retention sweep** wired into the existing 24h
+  `run_retention_cleanup` ticker in `auto_healer.rs`. Always-keep last 3
+  snapshots regardless of age; delete anything older than 7 days beyond
+  that floor. File-delete first; DB row stays for retry if the file
+  delete fails.
+- **Startup finalize hook** (`finalize_pending_on_startup` in
+  `services/panel_update.rs`). Closes out any `panel_snapshots` rows
+  with `to_version IS NULL` after a process restart by writing
+  `to_version = CARGO_PKG_VERSION`. Equal `from_version`/`to_version`
+  on a finalized row indicates `update.sh`'s in-flight rollback fired;
+  differing values indicate a successful apply.
+
+### Changed
+- **Update poller honours `update_channel`**
+  (`services/telemetry_collector.rs:302`). `hold` skips the poll;
+  `candidate` widens to `/releases?per_page=20` (first by `published_at`
+  desc); `stable` keeps the existing `/releases/latest` URL bit-for-bit.
+- **`scripts/update.sh` accepts two new env vars.**
+  `DOCKPANEL_NO_SELF_REFRESH=1` bypasses the v2.7.13 self-refresh block
+  so the orchestrator can stream a single subprocess invocation's stdout
+  into its state machine without a mid-flight re-exec breaking the pipe
+  (SSH-operator flow keeps self-refresh on by default).
+  `DOCKPANEL_VERSION=vX.Y.Z` pins the release tag instead of fetching
+  `/releases/latest`, so a candidate-channel pick can't race a GA
+  publish between the panel's poll and the operator's click.
+
+### Migration
+- One settings row inserted (`update_channel = 'stable'` — the implicit
+  pre-W4 default). Two new empty tables (`panel_snapshots`,
+  `fleet_update_runs`). No ALTER on existing tables; every install keeps
+  current behaviour until an admin clicks Apply or changes the channel.
+  Migration file: `20260520000000_panel_self_update.sql`.
+
+### Operator notes
+- Snapshots consume disk: ~150-300 MB each typical, retained 7 days
+  (last 3 always kept). Stored under `/var/backups/dockpanel/snapshots/`.
+  A free-disk pre-check refuses to create a snapshot if the partition
+  has less than 2 GiB free.
+- `update.sh`'s SSH-only flow continues working unchanged — no
+  operator forced to use the UI.
+- Cosign signature verification at download time is **not** in W4.
+  HTTPS-to-GitHub is the existing trust boundary; cosign verify is a
+  separate hardening pass (non-trivial key management).
+- The api process will be killed mid-binary-swap by `update.sh`'s
+  `systemctl stop dockpanel-api`. The orchestrator state lives in the
+  DB rows (`panel_snapshots.to_version`); the new process boots Idle
+  and the finalize hook closes out the in-flight row.
+
+## [2.9.0] - 2026-05-16
+
+Phase 4 W3 ships **on-call rotations** and **escalation policies**. A small
+team can now self-host their on-call schedule in DockPanel — when an alert
+fires, the panel pages whoever is on-call right now (not every channel on
+the rule); if the alert isn't acknowledged within a policy-defined
+threshold, the panel routes the page to the next step in the chain.
+
+Larger teams that already pay for PagerDuty keep using PagerDuty — the
+escalation policy supports a `webhook:<url>` route shape that forwards
+directly into their existing PD service key.
+
+### Added
+
+- **`on_call_schedules` table + admin tab.** A rotation = ordered list of
+  user IDs plus a cadence in days (1–90). "Who's on-call at time T" is
+  one-liner cadence math against an anchor; no calendar widget, no
+  per-day overrides, no holiday handling. New endpoints
+  `GET/POST/PUT/DELETE /api/on-call/schedules[/{id}]` (admin) and
+  `GET /api/on-call/whoami` (any authenticated user) for "am I on the
+  hook right now?"
+- **`escalation_policies` table + admin tab.** Policies are an ordered
+  JSONB array of `{after_minutes, route}` steps. Routes are
+  discriminated: `on_call_schedule:<uuid>` resolves to the current
+  rotation holder, `user:<uuid>` pages a specific user, `all_channels`
+  preserves the pre-W3 default (alert owner's channels),
+  `webhook:<url>` is a direct outbound webhook bypass. New endpoints
+  `GET/POST/PUT/DELETE /api/escalation-policies[/{id}]` (admin).
+- **Per-alert-rule policy attachment.** `alert_rules` gains a nullable
+  `escalation_policy_id` FK. NULL = pre-W3 hardcoded 15-min unack →
+  30-min re-page (unchanged for every existing rule). Admin-only attach
+  endpoint at `PUT /api/alert-rules/{rule_id}/escalation-policy`.
+- **Ack actor + optional comment.** `PUT /api/alerts/{id}/acknowledge`
+  now accepts an optional `{ "comment": "..." }` body (500-char cap)
+  and stores both `acknowledged_by` (the actor) and
+  `acknowledged_comment`. Older clients that PUT with no body keep
+  working — they just don't carry a comment. The UI surfaces actor
+  email + truncated comment inline on each acked alert row.
+- **Frontend tabs.** Alerts page grows two new tabs alongside Alerts +
+  Runbooks: an On-call editor (rotation CRUD with reorderable member
+  list) and an Escalation policies editor (step chain with route picker
+  + live route description).
+
+### Changed
+
+- **Escalation pages now carry the runbook payload.** Phase 4 W2 added
+  the runbook excerpt + URL to fire payloads via
+  `send_notification_with_runbook`, but `check_escalations` was still
+  calling bare `send_notification` — so re-pages on unacknowledged
+  alerts lost the runbook context that the original fire had carried.
+  The W3 rewrite of `check_escalations` extracts the shared
+  `load_runbook_payload` helper so fire and escalation paths produce
+  identical payloads.
+
+### Migration
+
+No manual action is required. `escalation_policy_id` is added to
+`alert_rules` as a nullable FK with default NULL — every existing rule
+keeps its pre-W3 behaviour bit-for-bit. The three new alerts columns
+(`acknowledged_by`, `acknowledged_comment`, `escalation_step_index`)
+default to NULL/0 on existing rows.
+
+## [2.8.23] - 2026-05-16
+
+### Changed
+
+- **SSL renewal cadence is now profile-aware.** The auto-healer previously
+  used a hardcoded 6h cooldown for both ARI re-fetch (RFC 9773) and the
+  post-attempt retry. For the new `shortlived` profile (6-day certs whose
+  renewal window is only ~4 days wide), 6h was 6% of the cert lifetime — a
+  CA-issued early-renew nudge could be missed by a full quarter-day, and a
+  failed attempt near expiry could burn the whole window. The cooldown is
+  now 1h for `shortlived` and stays at 6h for `tlsserver` (45d) and
+  `classic` (90d → 64d → 45d across the LE roadmap). Lets-Encrypt's
+  tlsserver profile transitioned to 45-day issuance on 2026-05-13, which
+  is what unblocked this change.
+
+### Added
+
+- **New Prometheus counter: `dockpanel_cert_renewals_total{result}`** with
+  `result="success"` and `result="failure"` labels. Tracks auto-healer
+  renewal attempts so operators can graph trend and alert on
+  `rate(...{result="failure"}[1h])`. The counter is process-local (resets
+  across restart — Prometheus `increase()` handles that gracefully) and
+  adds zero DB queries per scrape.
+
+  Exposed at `/metrics` alongside the existing `dockpanel_info`,
+  `dockpanel_site_count`, and `dockpanel_alerts_firing` gauges.
+
+## [2.8.22] - 2026-05-16
+
+### Fixed
+
+- **Webmail "Open" button on the Mail page was unreachable** ([#57] third
+  finding by @WiskeyPapa). The Roundcube container is bound to
+  `127.0.0.1:8888` on the host (loopback only — never exposed to the
+  public IP for security), but the frontend Open button generated a
+  `http://<panel-hostname>:8888` URL. That URL has nothing listening on
+  it (and Cloudflare doesn't proxy port 8888 anyway), so the button
+  produced a hang / connection refused.
+
+  Fixed by reverse-proxying Roundcube under `/webmail/` on the existing
+  panel nginx vhost via a drop-in fragment file. The frontend Open URL
+  is now `${origin}/webmail/` — same-origin, inherits the panel's TLS,
+  works on both HTTPS-with-domain and HTTP-on-IP installs. The
+  Roundcube container also gets new env vars
+  (`ROUNDCUBEMAIL_PROXY_WHITELIST=127.0.0.1`, plus
+  `ROUNDCUBEMAIL_TRUSTED_HOSTS` and `ROUNDCUBEMAIL_FORWARDED_PROTO=https`
+  when the panel has a configured `server_name`) so Roundcube accepts
+  the forwarded headers and generates correct URLs behind the proxy.
+
+### Changed
+
+- `webmail_install` is now idempotent — clicking Install when an existing
+  `dockpanel-roundcube` container is present tears it down before
+  recreating, so env-var additions across releases (like the v2.8.22
+  proxy/trusted-hosts envs) apply automatically on next Install click.
+  Users who deployed Roundcube on v2.8.20/v2.8.21 just need to click
+  Install again, which now rebuilds in place. The `webmail_remove`
+  endpoint also tears down the panel-vhost reverse-proxy fragment for
+  clean uninstall.
+
+- Panel nginx vhost gains an `include
+  /etc/nginx/conf.d/dockpanel-panel.locations/*.conf;` directive (baked
+  into `scripts/setup.sh`'s vhost template; injected into existing
+  vhosts by `scripts/update.sh` via an awk-based one-time migration —
+  same shape as the v2.8.3 IPv6-listen migration). Drop-in directory
+  for path-mounted tool reverse-proxies; webmail is the first user, but
+  other tools (phpMyAdmin, Adminer) can use the same mechanism in the
+  future.
+
+### Internal
+
+- New helper `panel_server_name()` in
+  `panel/agent/src/routes/mail.rs` reads the panel vhost's
+  `server_name` directive to drive Roundcube's `TRUSTED_HOSTS`
+  computation — same approach `update.sh` uses to detect the panel
+  domain for `BASE_URL` auto-population.
+- New helpers `write_webmail_nginx(port)` /
+  `remove_webmail_nginx()` write the `/webmail/` location fragment,
+  validate via `nginx -t`, and reload on success. Failed validation
+  unlinks the fragment so nginx is never left in a broken state.
+
+## [2.8.21] - 2026-05-16
+
+### Fixed
+
+- **Firewall add/remove rule returned "Agent offline" with `ufw: ERROR:
+  '/etc/ufw/user.rules' is not writable`** ([#57] follow-up by @WiskeyPapa).
+  The agent runs under `ProtectSystem=strict` with an explicit
+  `ReadWritePaths=` allowlist, and `/etc/ufw` was never in that list. `ufw
+  status` (read-only) worked, but writes to `user.rules` during add/delete
+  were blocked by the sandbox mount. Added `/etc/ufw` and `/var/lib/ufw` to
+  the canonical agent unit's `ReadWritePaths`, plus matching pre-create
+  entries in `scripts/setup.sh` and `scripts/update.sh` so the namespace
+  mount succeeds even on systems where ufw isn't installed yet. Same shape
+  of fix as the v2.8.13 expansion that added `/etc/modsecurity` /
+  `/etc/cloudflared` / `/etc/postfix` to the RWP list.
+
+- **Dashboard "Set up backups" onboarding step stayed incomplete after a
+  manual backup ran, and the card linked to Sites instead of the Backups
+  page** ([#57] follow-up by @WiskeyPapa). The completion check was
+  `sitesList.some(s => !!s.backup_schedule)`, but `/api/sites` doesn't
+  return a `backup_schedule` field — so the check was always false
+  regardless of how many backups had been created. Added a new
+  `GET /api/backup-setup-status` endpoint (auth-gated, scoped by user)
+  returning `{ has_schedule, has_backup }` derived from real DB counts
+  across `backup_schedules`, `backups`, `database_backups`, and
+  `volume_backups`. Dashboard now fetches the status once and the card
+  flips to complete as soon as any of those exist. Link retargeted from
+  `/sites/<id>` to `/backup-orchestrator` (the global backup view).
+
+## [2.8.20] - 2026-05-15
+
+### Fixed
+
+- **WAF install button stayed on "Install" after a successful install on
+  Ubuntu 24.04** ([#57] follow-up by @WiskeyPapa). Ubuntu Noble's
+  `time_t`-64 ABI transition renamed `libmodsecurity3` →
+  `libmodsecurity3t64` as a virtual-provides (no transitional shim). The
+  agent's `install_status` route was checking `dpkg -l libmodsecurity3`
+  literally, which never matches "ii" on Noble even though the install
+  succeeded — frontend therefore kept showing "Install". Detect path in
+  `routes/service_installer.rs::install_status` now accepts either name
+  (OR-clause, matching the existing PHP fallback pattern). Same fix
+  applied to `uninstall_waf`'s apt purge list so uninstall on Noble
+  actually removes the package instead of silently no-op'ing.
 
 ## [2.8.19] - 2026-05-10
 

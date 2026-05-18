@@ -77,7 +77,12 @@ fi
 # v2.7.13 — strands operators unable to upgrade. Pull the latest script
 # from the latest release tag and re-exec ourselves before running any
 # update logic. SELF_REFRESHED=1 prevents an infinite re-exec loop.
-if [ "${SELF_REFRESHED:-0}" != "1" ] && [ "$INSTALL_FROM_RELEASE" = "1" ]; then
+# DOCKPANEL_NO_SELF_REFRESH=1 — set by the panel-internal orchestrator
+# (services/panel_update.rs) so it can stream a single update.sh invocation's
+# stdout into its state machine without a mid-flight re-exec breaking the pipe.
+# SSH-operator flow keeps self-refresh on by default.
+if [ "${SELF_REFRESHED:-0}" != "1" ] && [ "$INSTALL_FROM_RELEASE" = "1" ] \
+   && [ "${DOCKPANEL_NO_SELF_REFRESH:-0}" != "1" ]; then
     LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
         | grep -m1 '"tag_name"' | cut -d'"' -f4 || true)
     if [ -n "$LATEST_TAG" ]; then
@@ -157,13 +162,23 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
         *) error "Unsupported architecture: $ARCH"; exit 1 ;;
     esac
 
-    log "Fetching latest release..."
-    RELEASE_TAG=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-    if [ -z "$RELEASE_TAG" ]; then
-        error "Could not determine latest release. Check https://github.com/${GITHUB_REPO}/releases"
-        exit 1
+    # DOCKPANEL_VERSION=vX.Y.Z (or vX.Y.Z-rc.N) — pin to a specific release
+    # tag instead of /releases/latest. Lets the panel-internal orchestrator
+    # honour the operator's candidate-channel pick and the in-process
+    # "available version" snapshot, instead of racing /releases/latest mid-
+    # apply (which could shift to a newer GA between poll and click).
+    if [ -n "${DOCKPANEL_VERSION:-}" ]; then
+        RELEASE_TAG="$DOCKPANEL_VERSION"
+        log "Pinned release: $RELEASE_TAG (DOCKPANEL_VERSION)"
+    else
+        log "Fetching latest release..."
+        RELEASE_TAG=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+        if [ -z "$RELEASE_TAG" ]; then
+            error "Could not determine latest release. Check https://github.com/${GITHUB_REPO}/releases"
+            exit 1
+        fi
+        log "Latest release: $RELEASE_TAG"
     fi
-    log "Latest release: $RELEASE_TAG"
     BASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}"
 
     log "Downloading agent (${DL_ARCH})..."
@@ -229,7 +244,8 @@ mkdir -p /var/lib/dockpanel/docker
 # missing entries, so pre-create everything the canonical unit references.
 for d in /etc/postfix /etc/dovecot /var/vmail /var/spool/postfix /run/opendkim /var/lib/nginx \
          /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns /etc/letsencrypt \
-         /var/cache/nginx/fastcgi; do
+         /var/cache/nginx/fastcgi \
+         /etc/ufw /var/lib/ufw; do
     [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || true
 done
 echo "d /run/dockpanel 0755 root root -" > /etc/tmpfiles.d/dockpanel.conf 2>/dev/null || true
@@ -502,15 +518,46 @@ if [ -d /etc/nginx/sites-enabled ]; then
 fi
 ensure_panel_https_fallback
 repair_panel_domain_site_vhosts
+
+# ── v2.8.22: ensure panel vhost includes dockpanel-panel.locations/*.conf ─
+# Drop-in dir for path-mounted tool reverse-proxies. Webmail uses this in
+# v2.8.22+ (writes webmail.conf on install, deletes on remove). Pre-v2.8.22
+# panel vhosts lack the include directive — inject it just before the
+# server-block closing brace via awk (sed nested-brace handling is fragile).
+mkdir -p /etc/nginx/conf.d/dockpanel-panel.locations
+for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
+    [ -f "$conf" ] || continue
+    if ! grep -q "dockpanel-panel.locations" "$conf"; then
+        # Inject before the FIRST top-level `}` (the server block close).
+        # Panel vhost has exactly one top-level `}`, so single-match is safe.
+        if awk '
+            /^}/ && !done {
+                print "    # Drop-in location blocks for path-mounted tools (webmail, etc.)";
+                print "    include /etc/nginx/conf.d/dockpanel-panel.locations/*.conf;";
+                print "";
+                done=1
+            }
+            { print }
+        ' "$conf" > "$conf.new" && [ -s "$conf.new" ]; then
+            mv "$conf.new" "$conf"
+            log "Added dockpanel-panel.locations include to $conf"
+            NGINX_NEEDS_RELOAD=1
+        else
+            rm -f "$conf.new"
+            log "WARN: failed to inject panel-locations include into $conf — skipped"
+        fi
+    fi
+done
+
 if [ "$NGINX_NEEDS_RELOAD" = "1" ]; then
     if nginx -t > /dev/null 2>&1; then
         if [ "$NGINX_NEEDS_RESTART" = "1" ]; then
-            systemctl restart nginx > /dev/null 2>&1 && log "Nginx restarted after listener normalization"
+            systemctl restart nginx > /dev/null 2>&1 && log "Nginx restarted after listener normalization + panel-locations migration"
         else
-            nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen migration"
+            nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen + panel-locations migration"
         fi
     else
-        log "WARN: nginx -t failed after IPv6 listen migration; not reloading. Check sites-enabled/."
+        log "WARN: nginx -t failed after IPv6 listen + panel-locations migration; not reloading. Check sites-enabled/."
     fi
 fi
 
